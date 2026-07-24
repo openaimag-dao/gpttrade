@@ -1,30 +1,47 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Crypto-Macro Correlation Bot
-============================
+Crypto-Macro Correlation Bot (Telegram)
+========================================
 
-Профессиональный локальный комбайн для макро- и корреляционного анализа BTC
-относительно традиционных рынков (DXY, QQQ, SPY, NVDA, MSFT) за период
-2018-2026 гг., дополненный ML-моделью прогноза роста BTC и отправкой
-итогового отчёта в Telegram.
+Интерактивный Telegram-бот для макро- и корреляционного анализа BTC
+относительно традиционных рынков (DXY, QQQ, SPY, NVDA, MSFT), с ML-моделью
+прогноза роста BTC, экспертными правилами и ежедневной автоматической
+рассылкой полного отчёта.
 
 Запуск:
-    python3 crypto_macro_bot.py [--leverage 5] [--telegram]
+    export TELEGRAM_BOT_TOKEN="..."
+    export TELEGRAM_CHAT_ID="..."   # чат для ежедневной рассылки в 09:00 UTC
+    python3 crypto_macro_bot.py
 """
 
-import argparse
+import asyncio
+import logging
 import os
 import sys
+import time
 import warnings
-from datetime import datetime
+from datetime import datetime, time as dt_time, timezone
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 warnings.filterwarnings("ignore")
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("crypto_macro_bot")
 
 # ---------------------------------------------------------------------------
 # 0. КОНФИГУРАЦИЯ
@@ -41,7 +58,6 @@ TICKERS = {
 }
 
 START_DATE = "2018-01-01"
-END_DATE = datetime.now().strftime("%Y-%m-%d")
 
 # Окна скользящей корреляции (в днях)
 CORR_WINDOWS = (30, 90, 180)
@@ -59,7 +75,6 @@ DEFAULT_LEVERAGE = 5  # плечо пользователя по умолчан�
 
 # Горизонты доходностей для ML-признаков (в днях)
 ML_RETURN_HORIZONS = (1, 3, 7, 14)
-# Активы, для которых считаются лаговые доходности как признаки ML-модели
 ML_RETURN_ASSETS = ("BTC", "DXY", "QQQ", "SPY", "NVDA")
 
 # Целевая переменная: рост BTC более чем на ML_TARGET_THRESHOLD
@@ -70,16 +85,26 @@ ML_TARGET_THRESHOLD = 0.02
 # Граница обучение/тест по умолчанию: обучаемся на 2018-2025, тестируем на 2025-2026
 ML_SPLIT_DATE = "2025-01-01"
 
+# Сколько секунд держать скачанные данные в кэше, прежде чем обновлять их
+# заново (защищает от повторных запросов к Yahoo Finance при частых нажатиях
+# кнопок и от rate-limit'ов yfinance).
+CACHE_TTL_SECONDS = 15 * 60
+
+# Время ежедневной автоматической рассылки полного отчёта (UTC)
+DAILY_REPORT_TIME_UTC = dt_time(hour=9, minute=0, tzinfo=timezone.utc)
+
 
 # ---------------------------------------------------------------------------
 # 1. СБОР И СИНХРОНИЗАЦИЯ ДАННЫХ
 # ---------------------------------------------------------------------------
-def download_prices(start: str = START_DATE, end: str = END_DATE) -> pd.DataFrame:
+def download_prices(start: str = START_DATE, end: str = None) -> pd.DataFrame:
     """
     Скачивает дневные цены закрытия (Close) по всем активам из TICKERS
-    и синхронизирует их в единый календарный ряд.
+    и синхронизирует их в единый календарный ряд. Синхронная (блокирующая)
+    функция - в боте всегда вызывается через asyncio.to_thread.
     """
-    print(f"[i] Скачивание дневных данных с {start} по {end} ...")
+    end = end or datetime.now().strftime("%Y-%m-%d")
+    logger.info("Скачивание дневных данных с %s по %s ...", start, end)
 
     raw = yf.download(
         list(TICKERS.values()),
@@ -101,11 +126,9 @@ def download_prices(start: str = START_DATE, end: str = END_DATE) -> pd.DataFram
     if isinstance(raw.columns, pd.MultiIndex):
         close = raw["Close"].copy()
     else:
-        # На случай, если по какой-то причине вернулся только один тикер
         close = raw[["Close"]].copy()
         close.columns = list(TICKERS.values())
 
-    # Переименовываем тикеры Yahoo в короткие алиасы (BTC, DXY, QQQ, ...)
     reverse_map = {yahoo_symbol: alias for alias, yahoo_symbol in TICKERS.items()}
     close = close.rename(columns=reverse_map)
 
@@ -116,40 +139,32 @@ def download_prices(start: str = START_DATE, end: str = END_DATE) -> pd.DataFram
     close = close[list(TICKERS.keys())]
 
     # --- Синхронизация временных рядов ---
-    # BTC торгуется 24/7 (365 дней в году), тогда как фондовый рынок
-    # работает только по будням (~252 дня в году). Чтобы ряды были
-    # сопоставимы день-в-день, строим полный календарный диапазон дат
-    # и переносим последнюю известную цену вперёд (forward fill) на
-    # выходные и праздники фондового рынка.
+    # BTC торгуется 24/7, фондовый рынок - 5 дней в неделю. Строим полный
+    # календарный диапазон дат и переносим последнюю известную цену вперёд
+    # (forward fill) на выходные и праздники фондового рынка.
     full_range = pd.date_range(start=close.index.min(), end=close.index.max(), freq="D")
     close = close.reindex(full_range).ffill()
-
-    # Отбрасываем самые первые дни, пока история есть не по всем активам
     close = close.dropna(how="any")
     close.index.name = "Date"
 
-    print(
-        f"[i] Данные синхронизированы: {len(close)} дневных наблюдений "
-        f"({close.index[0].date()} - {close.index[-1].date()})"
+    logger.info(
+        "Данные синхронизированы: %d наблюдений (%s - %s)",
+        len(close), close.index[0].date(), close.index[-1].date(),
     )
     return close
 
 
-# ---------------------------------------------------------------------------
-# 2. МАТЕМАТИЧЕСКИЙ БЛОК (Correlation Engine)
-# ---------------------------------------------------------------------------
 def build_analysis_frame(prices: pd.DataFrame) -> pd.DataFrame:
     """
     Строит единый DataFrame с ценами, дневной доходностью и скользящими
-    корреляциями. Именно этот DataFrame передаётся в движок правил
-    (apply_custom_expert_rules), в ML-модуль, в определение фазы рынка и в отчёт.
+    корреляциями. Именно этот DataFrame используется ML-модулем, движком
+    правил и генератором отчётов.
     """
     returns = prices.pct_change()
     returns.columns = [f"ret_{col}" for col in returns.columns]
 
     df = prices.join(returns)
 
-    # Скользящая корреляция доходностей BTC с каждым активом на трёх окнах
     for asset_a, asset_b in CORR_PAIRS:
         ret_a, ret_b = f"ret_{asset_a}", f"ret_{asset_b}"
         for window in CORR_WINDOWS:
@@ -159,15 +174,39 @@ def build_analysis_frame(prices: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# --- Кэш скачанных и обработанных данных (общий для всех пользователей бота) ---
+_cache = {"df": None, "timestamp": 0.0}
+_cache_lock = asyncio.Lock()
+
+
+async def get_analysis_data(force_refresh: bool = False) -> pd.DataFrame:
+    """
+    Возвращает актуальный DataFrame с ценами/доходностями/корреляциями,
+    используя кэш с TTL, чтобы не дёргать yfinance на каждое нажатие кнопки.
+    Скачивание и построение фрейма выполняются в отдельном потоке, чтобы
+    не блокировать asyncio event loop.
+    """
+    async with _cache_lock:
+        now = time.monotonic()
+        is_fresh = _cache["df"] is not None and (now - _cache["timestamp"]) < CACHE_TTL_SECONDS
+        if not force_refresh and is_fresh:
+            return _cache["df"]
+
+        prices = await asyncio.to_thread(download_prices)
+        df = await asyncio.to_thread(build_analysis_frame, prices)
+        _cache["df"] = df
+        _cache["timestamp"] = now
+        return df
+
+
 # ---------------------------------------------------------------------------
-# 3. МОДУЛЬ МАШИННОГО ОБУЧЕНИЯ
+# 2. МОДУЛЬ МАШИННОГО ОБУЧЕНИЯ
 # ---------------------------------------------------------------------------
 def build_ml_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Формирует таблицу признаков для ML-модели:
       - Доходности за 1/3/7/14 дней для BTC, DXY, QQQ, SPY, NVDA.
-      - Скользящие корреляции BTC с DXY/QQQ/SPY/NVDA/MSFT (30/90/180д),
-        уже посчитанные в build_analysis_frame.
+      - Скользящие корреляции BTC с DXY/QQQ/SPY/NVDA/MSFT (30/90/180д).
       - Волатильность (rolling std дневной доходности) DXY и QQQ.
       - Отношение цены BTC к его 50- и 200-дневной SMA.
     """
@@ -210,15 +249,13 @@ def train_ml_model(df: pd.DataFrame, split_date: str = ML_SPLIT_DATE) -> dict:
     Обучает классификатор (XGBoost, либо RandomForest как запасной вариант,
     если xgboost не установлен) предсказывать рост BTC > ML_TARGET_THRESHOLD
     на горизонте ML_TARGET_HORIZON дней. Обучение - на данных до split_date,
-    тест - на данных после split_date. Возвращает вероятность роста BTC
-    на текущий момент вместе с метриками качества модели.
+    тест - на данных после split_date. Синхронная (CPU-bound) функция -
+    в боте вызывается через asyncio.to_thread.
     """
     try:
         features = build_ml_features(df)
         target = build_ml_target(df)
 
-        # Последняя строка с полностью посчитанными признаками (для инференса);
-        # её таргет ещё не наступил, поэтому берём отдельно от обучающей выборки.
         features_complete = features.dropna()
         if features_complete.empty:
             return {"available": False, "reason": "Недостаточно истории для расчёта всех признаков."}
@@ -275,19 +312,19 @@ def train_ml_model(df: pd.DataFrame, split_date: str = ML_SPLIT_DATE) -> dict:
             "test_size": len(X_test),
             "as_of": latest_features.index[-1],
         }
-    except Exception as exc:  # ML-модуль не должен обрушивать весь отчёт
+    except Exception as exc:  # ML-модуль не должен обрушивать бота
         return {"available": False, "reason": f"Ошибка обучения ML-модели: {exc}"}
 
 
 # ---------------------------------------------------------------------------
-# 4. ДВИЖОК ПОЛЬЗОВАТЕЛЬСКОЙ ЭКСПЕРТИЗЫ (Rules Engine)
+# 3. ДВИЖОК ПОЛЬЗОВАТЕЛЬСКОЙ ЭКСПЕРТИЗЫ (Rules Engine)
 # ---------------------------------------------------------------------------
 def rule_catchup_effect(df: pd.DataFrame):
     """
     Правило 1: Раскорреляция и догоняющий рост (Catch-up).
-    Если QQQ растёт 3+ дня подряд, DXY за это время падает, а волатильность
-    BTC за последние 5 дней заметно ниже её 30-дневной нормы (накопление
-    в узком диапазоне) - высокий шанс догоняющего пробоя BTC вверх.
+    QQQ растёт 3+ дня подряд, DXY падает, а волатильность BTC за 5 дней
+    заметно ниже 30-дневной нормы (накопление в узком диапазоне) -
+    высокий шанс догоняющего пробоя BTC вверх.
     """
     if len(df) < 35:
         return None
@@ -348,10 +385,10 @@ def rule_dxy_pressure(df: pd.DataFrame, leverage: float = DEFAULT_LEVERAGE):
 def rule_vol_compression(df: pd.DataFrame):
     """
     Правило 3: Сжатие волатильности перед импульсом.
-    Если 30-дневная корреляция BTC с QQQ и с SPY одновременно упала ниже
-    0.15 по модулю (полная раскорреляция с TradFi), а DXY при этом торгуется
-    в узком диапазоне ("упёрся в уровень") - BTC движется на собственных
-    идиосинкразических драйверах, стоит следить за внутренними объёмами.
+    30-дневная корреляция BTC с QQQ и с SPY одновременно упала ниже 0.15
+    по модулю (полная раскорреляция с TradFi), а DXY торгуется в узком
+    диапазоне ("упёрся в уровень") - BTC движется на собственных
+    идиосинкразических драйверах.
     """
     if len(df) < 30:
         return None
@@ -366,7 +403,7 @@ def rule_vol_compression(df: pd.DataFrame):
 
     dxy_window = df["DXY"].iloc[-10:]
     dxy_range_pct = (dxy_window.max() - dxy_window.min()) / dxy_window.min() * 100
-    dxy_at_level = dxy_range_pct < 1.0  # DXY зажат в диапазоне < 1% за 10 дней
+    dxy_at_level = dxy_range_pct < 1.0
 
     if fully_decorrelated and dxy_at_level:
         return {
@@ -404,8 +441,6 @@ def apply_custom_expert_rules(df: pd.DataFrame, leverage: float = DEFAULT_LEVERA
         if result:
             flags.append(result)
 
-    # Правило давления DXY зависит от плеча пользователя (используется
-    # в тексте рекомендации), поэтому вызывается отдельно.
     dxy_flag = rule_dxy_pressure(df, leverage=leverage)
     if dxy_flag:
         flags.append(dxy_flag)
@@ -414,7 +449,7 @@ def apply_custom_expert_rules(df: pd.DataFrame, leverage: float = DEFAULT_LEVERA
 
 
 # ---------------------------------------------------------------------------
-# 5. ФАЗА РЫНКА И СЦЕНАРИЙ
+# 4. ФАЗА РЫНКА И СЦЕНАРИЙ
 # ---------------------------------------------------------------------------
 def determine_market_phase(df: pd.DataFrame) -> str:
     """Определяет текущую макро-фазу рынка: Risk-On / Risk-Off / Divergence."""
@@ -489,91 +524,73 @@ def generate_scenario(df: pd.DataFrame, flags: list, phase: str, ml_result: dict
 
 
 # ---------------------------------------------------------------------------
-# 6. ГЕНЕРАТОР СВОДКИ (Output Report)
+# 5. ФОРМАТИРОВАНИЕ ОТВЕТОВ (HTML для Telegram)
 # ---------------------------------------------------------------------------
 def _fmt_corr(value: float) -> str:
     return "  н/д " if pd.isna(value) else f"{value:+.2f}"
 
 
-def print_report(df: pd.DataFrame, flags: list, phase: str, scenario: str,
-                  leverage: float, ml_result: dict) -> None:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    GREEN = "\033[92m"
-    RED = "\033[91m"
-    YELLOW = "\033[93m"
-    CYAN = "\033[96m"
-
-    width = 84
+def format_correlation_section(df: pd.DataFrame) -> str:
+    """Раздел '📊 Макро-корреляции': только табличка корреляций 30/90/180д."""
     last = df.iloc[-1]
     date_str = df.index[-1].strftime("%Y-%m-%d")
 
-    print("\n" + "=" * width)
-    print(f"{BOLD}{'МАКРО-КОРРЕЛЯЦИОННЫЙ ОТЧЁТ: BTC vs TRADFI'.center(width)}{RESET}")
-    print(f"{('Дата: ' + date_str + '  |  Плечо пользователя: ' + str(leverage) + 'x').center(width)}")
-    print("=" * width)
-
-    print(f"\n{BOLD}Текущие цены закрытия:{RESET}")
-    print(
-        f"  BTC: ${last['BTC']:,.0f}    DXY: {last['DXY']:.2f}    "
-        f"QQQ: ${last['QQQ']:.2f}    SPY: ${last['SPY']:.2f}    "
-        f"NVDA: ${last['NVDA']:.2f}    MSFT: ${last['MSFT']:.2f}"
-    )
-
-    print(f"\n{BOLD}Скользящая корреляция доходностей BTC:{RESET}")
-    header = f"  {'Пара':<14}{'30д':>10}{'90д':>10}{'180д':>10}"
-    print(header)
-    print("  " + "-" * (len(header) - 2))
+    lines = [f"📊 <b>Макро-корреляции BTC</b>", f"🗓 {date_str}", ""]
+    lines.append("<pre>")
+    lines.append(f"{'Пара':<12}{'30д':>8}{'90д':>8}{'180д':>8}")
+    lines.append("-" * 36)
     for asset_a, asset_b in CORR_PAIRS:
-        row = f"  {asset_a + '/' + asset_b:<14}"
+        row = f"{asset_a + '/' + asset_b:<12}"
         for window in CORR_WINDOWS:
-            row += f"{_fmt_corr(last[f'corr_{asset_a}_{asset_b}_{window}']):>10}"
-        print(row)
+            value = last[f"corr_{asset_a}_{asset_b}_{window}"]
+            row += f"{_fmt_corr(value):>8}"
+        lines.append(row)
+    lines.append("</pre>")
+    return "\n".join(lines)
 
-    print(f"\n{BOLD}Фаза рынка:{RESET} {CYAN}{phase}{RESET}")
 
-    print(f"\n{BOLD}ML-модель:{RESET}")
-    if ml_result.get("available"):
-        print(
-            f"  Модель: {ml_result['model_name']}  |  Обучена на {ml_result['train_size']} "
-            f"наблюдениях, протестирована на {ml_result['test_size']}"
+def format_ml_section(ml_result: dict) -> str:
+    """Раздел '🤖 ML-Прогноз': вероятность роста BTC по модели."""
+    if not ml_result.get("available"):
+        return (
+            "🤖 <b>ML-Прогноз</b>\n\n"
+            f"⚠️ Недоступно: {ml_result.get('reason', 'неизвестная причина')}"
         )
-        accuracy_str = (
-            f"{ml_result['test_accuracy'] * 100:.1f}%" if ml_result["test_accuracy"] is not None else "н/д"
-        )
-        print(f"  Точность на тестовой выборке (2025-2026): {accuracy_str}")
-        print(
-            f"  Вероятность роста BTC > {ML_TARGET_THRESHOLD * 100:.0f}% за "
-            f"{ML_TARGET_HORIZON} дня: {BOLD}{ml_result['probability_up']:.0f}%{RESET}"
-        )
-    else:
-        print(f"  Недоступно: {ml_result.get('reason', 'неизвестная причина')}")
 
-    print(f"\n{BOLD}Сработавшие правила экспертизы:{RESET}")
-    if not flags:
-        print("  Нет активных сигналов.")
-    else:
-        level_color = {"INFO": GREEN, "WARNING": YELLOW, "CRITICAL": RED}
-        for flag in flags:
-            color = level_color.get(flag["level"], RESET)
-            print(f"  [{color}{flag['level']}{RESET}] {BOLD}{flag['title']}{RESET}")
-            print(f"      -> {flag['message']}")
-
-    print(f"\n{BOLD}Вероятный сценарий BTC (24-72ч):{RESET}")
-    print(f"  {scenario}")
-
-    print(f"\n{'-' * width}")
-    print(
-        "  ВНИМАНИЕ: отчёт основан на статистических корреляциях, эвристических\n"
-        "  правилах и ML-модели, обученной на исторических данных. Это не является\n"
-        "  финансовой рекомендацией. Всегда проверяйте риски самостоятельно."
+    lines = [
+        "🤖 <b>ML-Прогноз</b>",
+        "",
+        f"Модель: <b>{ml_result['model_name']}</b>",
+        f"Обучена на {ml_result['train_size']} набл., тест — {ml_result['test_size']} набл.",
+    ]
+    if ml_result["test_accuracy"] is not None:
+        lines.append(f"Точность на тестовой выборке (2025-2026): {ml_result['test_accuracy'] * 100:.1f}%")
+    lines.append("")
+    lines.append(
+        f"📈 Вероятность роста BTC &gt;{ML_TARGET_THRESHOLD * 100:.0f}% за "
+        f"{ML_TARGET_HORIZON} дня: <b>{ml_result['probability_up']:.0f}%</b>"
     )
-    print("=" * width + "\n")
+    return "\n".join(lines)
 
 
-def format_telegram_message(df: pd.DataFrame, flags: list, phase: str, scenario: str,
-                             leverage: float, ml_result: dict) -> str:
-    """Форматирует отчёт с эмодзи для отправки в Telegram (HTML parse_mode)."""
+def format_rules_section(flags: list, leverage: float) -> str:
+    """Раздел '🧠 Экспертные сигналы': сработавшие правила для плеча 3x-5x."""
+    level_emoji = {"INFO": "ℹ️", "WARNING": "⚠️", "CRITICAL": "🚨"}
+    lines = [f"🧠 <b>Экспертные сигналы</b> (плечо {leverage:.0f}x)", ""]
+
+    if not flags:
+        lines.append("Нет активных сигналов.")
+    else:
+        for flag in flags:
+            emoji = level_emoji.get(flag["level"], "•")
+            lines.append(f"{emoji} <b>{flag['title']}</b>\n{flag['message']}\n")
+
+    return "\n".join(lines)
+
+
+def format_full_report(df: pd.DataFrame, flags: list, phase: str, scenario: str,
+                        leverage: float, ml_result: dict) -> str:
+    """Раздел '📝 Полный отчёт': сводка всех блоков."""
     last = df.iloc[-1]
     date_str = df.index[-1].strftime("%Y-%m-%d")
 
@@ -587,7 +604,7 @@ def format_telegram_message(df: pd.DataFrame, flags: list, phase: str, scenario:
     level_emoji = {"INFO": "ℹ️", "WARNING": "⚠️", "CRITICAL": "🚨"}
 
     lines = [
-        "📊 <b>МАКРО-ОТЧЁТ BTC vs TRADFI</b>",
+        "📝 <b>МАКРО-ОТЧЁТ BTC vs TRADFI</b>",
         f"🗓 {date_str}  |  Плечо: {leverage:.0f}x",
         "",
         f"₿ BTC: ${last['BTC']:,.0f}    💵 DXY: {last['DXY']:.2f}",
@@ -622,97 +639,149 @@ def format_telegram_message(df: pd.DataFrame, flags: list, phase: str, scenario:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# 7. TELEGRAM-ИНТЕГРАЦИЯ
-# ---------------------------------------------------------------------------
-def send_telegram_report(message: str, bot_token: str = None, chat_id: str = None) -> bool:
-    """
-    Отправляет текстовый отчёт в Telegram через Bot API.
-    Токен и chat_id берутся из аргументов, а если не переданы -
-    из переменных окружения TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.
-    """
-    bot_token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
+async def build_full_report_text(df: pd.DataFrame, leverage: float = DEFAULT_LEVERAGE) -> str:
+    """Собирает ML-прогноз, правила, фазу и сценарий в единый текст отчёта."""
+    ml_result = await asyncio.to_thread(train_ml_model, df)
+    flags = apply_custom_expert_rules(df, leverage=leverage)
+    phase = determine_market_phase(df)
+    scenario = generate_scenario(df, flags, phase, ml_result=ml_result)
+    return format_full_report(df, flags, phase, scenario, leverage, ml_result)
 
-    if not bot_token or not chat_id:
-        print(
-            "[i] Отправка в Telegram пропущена: не заданы TELEGRAM_BOT_TOKEN / "
-            "TELEGRAM_CHAT_ID (переменные окружения или --telegram-token/--telegram-chat-id)."
-        )
-        return False
 
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+# ---------------------------------------------------------------------------
+# 6. TELEGRAM: МЕНЮ И ОБРАБОТЧИКИ
+# ---------------------------------------------------------------------------
+MENU_BUTTONS = [
+    [InlineKeyboardButton("📊 Макро-корреляции", callback_data="corr")],
+    [InlineKeyboardButton("🤖 ML-Прогноз", callback_data="ml")],
+    [InlineKeyboardButton("🧠 Экспертные сигналы", callback_data="rules")],
+    [InlineKeyboardButton("📝 Полный отчёт", callback_data="full")],
+]
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(MENU_BUTTONS)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start и /menu - приветствие и главное меню с inline-кнопками."""
+    await update.effective_message.reply_text(
+        "👋 <b>Crypto-Macro Correlation Bot</b>\n\n"
+        "Я слежу за корреляцией BTC с DXY, QQQ, SPY, NVDA и MSFT, прогоняю "
+        "данные через ML-модель и набор экспертных правил для торговли "
+        "с плечом 3x-5x.\n\n"
+        "Выберите раздел:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия на inline-кнопки главного меню."""
+    query = update.callback_query
+    await query.answer()  # подтверждаем нажатие, чтобы убрать "часики" в клиенте
+
+    await query.edit_message_text("⏳ Считаю, минутку...", reply_markup=None)
 
     try:
-        response = requests.post(url, json=payload, timeout=15)
-        response.raise_for_status()
-        print("[i] Отчёт успешно отправлен в Telegram.")
-        return True
-    except requests.RequestException as exc:
-        print(f"[ошибка] Не удалось отправить отчёт в Telegram: {exc}", file=sys.stderr)
-        return False
+        df = await get_analysis_data()
+    except Exception as exc:
+        logger.exception("Не удалось получить рыночные данные")
+        await query.edit_message_text(
+            f"⚠️ Не удалось получить данные с Yahoo Finance: {exc}\n\n"
+            "Попробуйте ещё раз чуть позже.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    action = query.data
+    leverage = DEFAULT_LEVERAGE
+
+    try:
+        if action == "corr":
+            text = format_correlation_section(df)
+        elif action == "ml":
+            ml_result = await asyncio.to_thread(train_ml_model, df)
+            text = format_ml_section(ml_result)
+        elif action == "rules":
+            flags = apply_custom_expert_rules(df, leverage=leverage)
+            text = format_rules_section(flags, leverage)
+        elif action == "full":
+            text = await build_full_report_text(df, leverage)
+        else:
+            text = "Неизвестная команда. Нажмите /start, чтобы открыть меню заново."
+    except Exception as exc:
+        logger.exception("Ошибка при формировании раздела '%s'", action)
+        text = f"⚠️ Произошла ошибка при расчёте: {exc}"
+
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик ошибок - логирует и не даёт боту упасть."""
+    logger.error("Необработанное исключение при обработке апдейта", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ Внутренняя ошибка бота: {context.error}",
+            )
+        except Exception:
+            pass  # если даже сообщение об ошибке не отправляется - молча логируем
+
+
+# ---------------------------------------------------------------------------
+# 7. ЕЖЕДНЕВНАЯ АВТОМАТИЧЕСКАЯ РАССЫЛКА (JobQueue / APScheduler)
+# ---------------------------------------------------------------------------
+async def send_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Каждый день в DAILY_REPORT_TIME_UTC отправляет полный отчёт в TELEGRAM_CHAT_ID."""
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not chat_id:
+        logger.warning("TELEGRAM_CHAT_ID не задан - ежедневная рассылка пропущена.")
+        return
+
+    try:
+        df = await get_analysis_data(force_refresh=True)
+        text = await build_full_report_text(df, DEFAULT_LEVERAGE)
+    except Exception as exc:
+        logger.exception("Не удалось сформировать ежедневный отчёт")
+        text = f"⚠️ Не удалось сформировать ежедневный отчёт: {exc}"
+
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
 # 8. ТОЧКА ВХОДА
 # ---------------------------------------------------------------------------
-def parse_args():
-    parser = argparse.ArgumentParser(description="Crypto-Macro Correlation Bot")
-    parser.add_argument(
-        "--leverage",
-        type=float,
-        default=DEFAULT_LEVERAGE,
-        help="Плечо пользователя для правила управления рисками (по умолчанию 5)",
-    )
-    parser.add_argument("--start", type=str, default=START_DATE, help="Дата начала выборки (YYYY-MM-DD)")
-    parser.add_argument("--end", type=str, default=END_DATE, help="Дата конца выборки (YYYY-MM-DD)")
-    parser.add_argument(
-        "--ml-split-date",
-        type=str,
-        default=ML_SPLIT_DATE,
-        help="Граница между обучающей и тестовой выборкой ML-модели (по умолчанию 2025-01-01)",
-    )
-    parser.add_argument(
-        "--telegram",
-        action="store_true",
-        help="Отправить отчёт в Telegram (требует TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID)",
-    )
-    parser.add_argument("--telegram-token", type=str, default=None, help="Токен Telegram-бота (переопределяет env)")
-    parser.add_argument("--telegram-chat-id", type=str, default=None, help="Chat ID Telegram (переопределяет env)")
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
-
-    try:
-        prices = download_prices(start=args.start, end=args.end)
-    except Exception as exc:
-        print(f"[ошибка] Не удалось получить данные: {exc}", file=sys.stderr)
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        print(
+            "[ошибка] Переменная окружения TELEGRAM_BOT_TOKEN не задана.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    df = build_analysis_frame(prices)
-
-    print("[i] Обучение ML-модели прогноза роста BTC ...")
-    ml_result = train_ml_model(df, split_date=args.ml_split_date)
-
-    flags = apply_custom_expert_rules(df, leverage=args.leverage)
-    phase = determine_market_phase(df)
-    scenario = generate_scenario(df, flags, phase, ml_result=ml_result)
-
-    print_report(df, flags, phase, scenario, leverage=args.leverage, ml_result=ml_result)
-
-    if args.telegram:
-        message = format_telegram_message(
-            df, flags, phase, scenario, leverage=args.leverage, ml_result=ml_result
+    if not os.environ.get("TELEGRAM_CHAT_ID"):
+        logger.warning(
+            "TELEGRAM_CHAT_ID не задан - ежедневная автоматическая рассылка работать не будет "
+            "(интерактивное меню по кнопкам продолжит работать для любого пользователя)."
         )
-        send_telegram_report(message, bot_token=args.telegram_token, chat_id=args.telegram_chat_id)
+
+    application = ApplicationBuilder().token(bot_token).build()
+
+    application.add_handler(CommandHandler(["start", "menu"], cmd_start))
+    application.add_handler(CallbackQueryHandler(on_menu_button))
+    application.add_error_handler(error_handler)
+
+    application.job_queue.run_daily(
+        send_daily_report,
+        time=DAILY_REPORT_TIME_UTC,
+        name="daily_full_report",
+    )
+
+    logger.info("Бот запущен, ожидаю сообщений... (ежедневный отчёт в %s UTC)", DAILY_REPORT_TIME_UTC)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
