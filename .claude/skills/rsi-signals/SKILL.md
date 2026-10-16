@@ -1,6 +1,6 @@
 ---
 name: rsi-signals
-description: Исполнить ожидающие сигналы RSI-бота (rsi_bot.py, MODE=signals) через Binance MCP с подтверждением пользователя. Используй, когда пользователь пишет /rsi-signals, «проверь сигналы», «исполни сигнал RSI».
+description: Исполнить ожидающие сигналы торгового бота (rsi_bot.py, MODE=signals, любая стратегия: rsi, ema_cross, donchian…) через Binance MCP с подтверждением пользователя. Используй, когда пользователь пишет /rsi-signals, «проверь сигналы», «исполни сигнал RSI».
 ---
 
 # Сигналы RSI → Binance MCP

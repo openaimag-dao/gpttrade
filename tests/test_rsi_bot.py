@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 import rsi_bot
-from rsi_bot import Config, Trader, backtest, compute_rsi, process_candles, rsi_signal
+from rsi_bot import Config, Trader, backtest, compute_rsi, process_candles, strategy_signals
 
 
 def make_df(closes):
@@ -32,11 +32,12 @@ def test_rsi_bounds_and_only_gains():
     assert rsi.dropna().between(0, 100).all()
 
 
-def test_rsi_signal_crossings():
-    assert rsi_signal(25, 31, 30, 70) == "buy"
-    assert rsi_signal(75, 69, 30, 70) == "sell"
-    assert rsi_signal(25, 28, 30, 70) is None
-    assert rsi_signal(math.nan, 31, 30, 70) is None
+def test_rsi_crossings(monkeypatch):
+    fake = pd.Series([math.nan, 25, 31, 28, 75, 69, 72])
+    monkeypatch.setattr(rsi_bot, "compute_rsi", lambda close, period: fake)
+    entries, exits, _ = strategy_signals(make_df(range(1, 8)), Config(rsi_buy=30, rsi_sell=70))
+    assert entries.tolist() == [False, False, True, False, True, False, False]  # 28→75 тоже пересечение
+    assert exits.tolist() == [False, False, False, False, False, True, False]
 
 
 def test_config_validation(monkeypatch):
@@ -244,13 +245,38 @@ def test_backtest_reports_risk_metrics():
     assert res["profit_factor"] >= 0
 
 
-def test_optimize_walk_forward():
+def test_walk_forward_uses_only_unseen_data_for_tests():
     rng = np.random.default_rng(3)
     df = make_df(100 * np.exp(rng.normal(0, 0.01, 3000).cumsum()))
-    r = rsi_bot.optimize(df, Config(), min_trades=1)
-    assert r["tested"] > 0
-    assert r["test_period"][0] > r["train_period"][1] - pd.Timedelta("15min")
-    assert set(r["best_params"]) == set(rsi_bot.OPTIMIZE_GRID)
+    r = rsi_bot.walk_forward(df, Config(), "ema_cross", folds=3, min_trades=1)
+    assert len(r["folds"]) == 3
+    chunk = len(df) // 4
+    for k, f in enumerate(r["folds"], 1):
+        assert f["period"][0] == df["ts"].iloc[k * chunk]  # тест начинается после обучения
+    assert r["oos_trades"] == sum(f["test"]["trades"] for f in r["folds"] if f["test"])
+
+
+@pytest.mark.parametrize("strategy", rsi_bot.STRATEGIES)
+def test_every_strategy_backtests_and_signals(strategy):
+    rng = np.random.default_rng(4)
+    df = make_df(100 * np.exp(rng.normal(0, 0.01, 1500).cumsum()))
+    cfg = Config(strategy=strategy, trend_ema=0, stop_loss_pct=5, take_profit_pct=0)
+    cfg.validate()
+    entries, exits, label = strategy_signals(df, cfg)
+    assert entries.dtype == bool and len(entries) == len(df) and entries.any() and exits.any()
+    assert label
+    assert backtest(df, cfg)["trades"] > 0
+
+
+def test_signals_have_no_lookahead():
+    """Сигнал на свече i не должен зависеть от будущих свечей."""
+    rng = np.random.default_rng(5)
+    df = make_df(100 * np.exp(rng.normal(0, 0.01, 800).cumsum()))
+    for strategy in rsi_bot.STRATEGIES:
+        cfg = Config(strategy=strategy)
+        full_e, full_x, _ = strategy_signals(df, cfg)
+        part_e, part_x, _ = strategy_signals(df.iloc[:600], cfg)
+        assert (full_e[:600] == part_e).all() and (full_x[:600] == part_x).all(), strategy
 
 
 class PagedExchange:

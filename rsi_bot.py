@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""RSI-бот для спотовой торговли на Binance.
+"""Торговый бот для спота Binance (только long) с выбором стратегии.
 
-Стратегия (только long, спот):
-  * ПОКУПКА — RSI закрытой свечи пересёк уровень RSI_BUY снизу вверх
-    (выход из зоны перепроданности) и позиции нет.
-  * ПРОДАЖА — RSI пересёк уровень RSI_SELL сверху вниз (выход из зоны
-    перекупленности), либо сработал стоп-лосс / тейк-профит.
+Стратегии (переменная STRATEGY):
+  * rsi       — по умолчанию: покупка, когда RSI выходит из перепроданности
+                (пересекает RSI_BUY снизу вверх), продажа — RSI_SELL сверху вниз.
+  * ema_cross — пересечение быстрой и медленной EMA (следование за трендом).
+  * donchian  — пробой максимума за N свечей, выход по минимуму за M свечей.
+  * bollinger — возврат цены внутрь нижней полосы Боллинджера, выход у средней.
+  * macd      — пересечение MACD(12,26) и сигнальной линии (9).
+Поверх любой стратегии: стоп-лосс, тейк-профит, трейлинг-стоп, фильтр тренда
+EMA и пауза после серии убытков.
 
 Режимы (переменная MODE):
   * paper   — по умолчанию: реальные котировки, сделки только симулируются.
@@ -17,6 +21,7 @@
 Команды:
   python3 rsi_bot.py            — запустить бота
   python3 rsi_bot.py backtest   — прогнать стратегию на истории
+  python3 rsi_bot.py optimize --strategy all — сравнить стратегии (walk-forward)
   python3 rsi_bot.py signals    — ожидающие сигналы (JSON)
   python3 rsi_bot.py confirm ID --price P --amount A [--quote Q]
   python3 rsi_bot.py reject ID
@@ -54,9 +59,16 @@ def _env_float(name: str, default: float) -> float:
 class Config:
     symbol: str = os.getenv("SYMBOL", "BTC/USDT")
     timeframe: str = os.getenv("TIMEFRAME", "1h")
+    strategy: str = os.getenv("STRATEGY", "rsi").lower()
     rsi_period: int = int(os.getenv("RSI_PERIOD", 14))
     rsi_buy: float = _env_float("RSI_BUY", 30)
     rsi_sell: float = _env_float("RSI_SELL", 70)
+    fast_ema: int = int(os.getenv("FAST_EMA", 20))           # ema_cross
+    slow_ema: int = int(os.getenv("SLOW_EMA", 100))          # ema_cross
+    channel_entry: int = int(os.getenv("CHANNEL_ENTRY", 20))  # donchian
+    channel_exit: int = int(os.getenv("CHANNEL_EXIT", 10))    # donchian
+    bb_period: int = int(os.getenv("BB_PERIOD", 20))          # bollinger
+    bb_std: float = _env_float("BB_STD", 2)                   # bollinger
     order_usdt: float = _env_float("ORDER_USDT", 20)
     stop_loss_pct: float = _env_float("STOP_LOSS_PCT", 3)
     take_profit_pct: float = _env_float("TAKE_PROFIT_PCT", 6)
@@ -82,8 +94,12 @@ class Config:
     def validate(self) -> None:
         if self.mode not in ("paper", "signals", "testnet", "live"):
             raise ValueError(f"MODE должен быть paper, signals, testnet или live, а не {self.mode!r}")
+        if self.strategy not in STRATEGIES:
+            raise ValueError(f"STRATEGY должна быть одной из {', '.join(STRATEGIES)}")
         if not 0 < self.rsi_buy < self.rsi_sell < 100:
             raise ValueError("Нужно 0 < RSI_BUY < RSI_SELL < 100")
+        if self.strategy == "ema_cross" and self.fast_ema >= self.slow_ema:
+            raise ValueError("Нужно FAST_EMA < SLOW_EMA")
         if self.mode in ("testnet", "live") and not (self.api_key and self.api_secret):
             raise ValueError("Для testnet/live задайте BINANCE_API_KEY и BINANCE_API_SECRET")
         if self.mode == "live" and os.getenv("CONFIRM_LIVE", "").lower() != "yes":
@@ -96,34 +112,91 @@ class Config:
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     """RSI по Уайлдеру (как в TradingView и на Binance)."""
-    delta = close.diff().to_numpy()
-    rsi = pd.Series(float("nan"), index=close.index)
-    if len(close) <= period:
-        return rsi
-    gains, losses = delta.clip(min=0), -delta.clip(max=0)
-    # Затравка — простое среднее первых `period` изменений, далее сглаживание Уайлдера.
-    avg_gain, avg_loss = gains[1:period + 1].mean(), losses[1:period + 1].mean()
-    for i in range(period, len(close)):
-        if i > period:
-            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rsi.iloc[i] = 100.0 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss)
-    return rsi
-
-
-def rsi_signal(prev_rsi: float, curr_rsi: float, buy_level: float, sell_level: float) -> str | None:
-    """'buy' / 'sell' при пересечении уровней, иначе None."""
-    if pd.isna(prev_rsi) or pd.isna(curr_rsi):
-        return None
-    if prev_rsi < buy_level <= curr_rsi:
-        return "buy"
-    if prev_rsi > sell_level >= curr_rsi:
-        return "sell"
-    return None
+    delta = close.diff().to_numpy(float)
+    out = np.full(len(close), np.nan)
+    if len(close) > period:
+        gains, losses = delta.clip(min=0), -delta.clip(max=0)
+        # Затравка — простое среднее первых `period` изменений, далее сглаживание Уайлдера.
+        avg_gain, avg_loss = gains[1:period + 1].mean(), losses[1:period + 1].mean()
+        for i in range(period, len(close)):
+            if i > period:
+                avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+                avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+            out[i] = 100.0 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss)
+    return pd.Series(out, index=close.index)
 
 
 def compute_ema(close: pd.Series, period: int) -> pd.Series:
     return close.ewm(span=period, adjust=False, min_periods=period).mean()
+
+
+def _prev(a: np.ndarray, fill) -> np.ndarray:
+    out = np.roll(a, 1)
+    out[:1] = fill
+    return out
+
+
+def _crosses(fast: np.ndarray, slow: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(пересечение снизу вверх, сверху вниз); NaN считается отсутствием сигнала."""
+    valid = ~np.isnan(fast) & ~np.isnan(slow)
+    above = valid & (fast > slow)
+    below = valid & (fast < slow)
+    return above & _prev(below, False), below & _prev(above, False)
+
+
+def strategy_signals(df: pd.DataFrame, cfg: Config) -> tuple[np.ndarray, np.ndarray, str]:
+    """Сигналы стратегии по закрытым свечам: (входы, выходы, описание последней свечи).
+
+    Индикаторы используют только прошлые и текущую свечу — заглядывания в
+    будущее нет, поэтому один расчёт по всей истории годится и для бэктеста.
+    """
+    close = df["close"]
+    c = close.to_numpy(float)
+    with np.errstate(invalid="ignore"):
+        if cfg.strategy == "rsi":
+            rsi = compute_rsi(close, cfg.rsi_period).to_numpy()
+            prev = _prev(rsi, np.nan)
+            entries = (prev < cfg.rsi_buy) & (rsi >= cfg.rsi_buy)
+            exits = (prev > cfg.rsi_sell) & (rsi <= cfg.rsi_sell)
+            label = f"RSI={rsi[-1]:.1f}"
+        elif cfg.strategy == "ema_cross":
+            fast = compute_ema(close, cfg.fast_ema).to_numpy()
+            slow = compute_ema(close, cfg.slow_ema).to_numpy()
+            entries, exits = _crosses(fast, slow)
+            label = f"EMA{cfg.fast_ema}={fast[-1]:.4f} EMA{cfg.slow_ema}={slow[-1]:.4f}"
+        elif cfg.strategy == "donchian":
+            upper = df["high"].rolling(cfg.channel_entry).max().shift(1).to_numpy()
+            lower = df["low"].rolling(cfg.channel_exit).min().shift(1).to_numpy()
+            entries, exits = c > upper, c < lower
+            label = f"канал {lower[-1]:.4f}–{upper[-1]:.4f}"
+        elif cfg.strategy == "bollinger":
+            mid = close.rolling(cfg.bb_period).mean()
+            low_band = (mid - cfg.bb_std * close.rolling(cfg.bb_period).std(ddof=0)).to_numpy()
+            mid = mid.to_numpy()
+            entries = (_prev(c, np.nan) < _prev(low_band, np.nan)) & (c >= low_band)
+            exits = c >= mid
+            label = f"BB нижняя={low_band[-1]:.4f} средняя={mid[-1]:.4f}"
+        elif cfg.strategy == "macd":
+            macd = (compute_ema(close, 12) - compute_ema(close, 26))
+            signal = macd.ewm(span=9, adjust=False).mean().to_numpy()
+            macd = macd.to_numpy()
+            entries, exits = _crosses(macd, signal)
+            label = f"MACD={macd[-1]:.4f} сигнал={signal[-1]:.4f}"
+        else:
+            raise ValueError(f"Неизвестная стратегия {cfg.strategy!r}")
+    return entries, exits, label
+
+
+STRATEGIES = ("rsi", "ema_cross", "donchian", "bollinger", "macd")
+
+
+def trend_mask(df: pd.DataFrame, cfg: Config) -> np.ndarray:
+    """True там, где фильтр тренда разрешает покупку (цена выше EMA)."""
+    if cfg.trend_ema <= 0:
+        return np.ones(len(df), dtype=bool)
+    ema = compute_ema(df["close"], cfg.trend_ema).to_numpy()
+    with np.errstate(invalid="ignore"):
+        return df["close"].to_numpy(float) > ema
 
 
 def stop_price(entry: float, peak: float, cfg: Config) -> tuple[float | None, str]:
@@ -260,8 +333,8 @@ def evaluate(df: pd.DataFrame, state: dict, cfg: Config) -> dict | None:
     df — свечи, последняя может быть ещё не закрыта. Отмечает обработанную
     свечу в state['last_candle'].
     """
-    closed = df.iloc[:-1]  # сигналы RSI только по закрытым свечам
-    if len(closed) < cfg.rsi_period + 2:
+    closed = df.iloc[:-1]  # сигналы только по закрытым свечам
+    if len(closed) < 3:
         return None
     last_price = float(df["close"].iloc[-1])
     pos = state["position"]
@@ -278,24 +351,23 @@ def evaluate(df: pd.DataFrame, state: dict, cfg: Config) -> dict | None:
         return None  # эту свечу уже обработали
     state["last_candle"] = candle_ts
 
-    rsi = compute_rsi(closed["close"], cfg.rsi_period)
-    signal = rsi_signal(rsi.iloc[-2], rsi.iloc[-1], cfg.rsi_buy, cfg.rsi_sell)
-    logger.info("%s %s close=%.4f RSI=%.2f signal=%s", cfg.symbol, candle_ts,
-                closed["close"].iloc[-1], rsi.iloc[-1], signal)
-    if signal == "sell" and pos:
-        return {"side": "sell", "price": last_price, "reason": f"RSI={rsi.iloc[-1]:.1f}"}
-    if signal != "buy" or pos:
+    entries, exits, label = strategy_signals(closed, cfg)
+    signal = "buy" if entries[-1] else "sell" if exits[-1] else None
+    logger.info("%s %s close=%.4f %s %s signal=%s", cfg.symbol, candle_ts,
+                closed["close"].iloc[-1], cfg.strategy, label, signal)
+    reason = f"{cfg.strategy}: {label}"
+    if exits[-1] and pos:
+        return {"side": "sell", "price": last_price, "reason": reason}
+    if not entries[-1] or pos:
         return None
     if closed["ts"].iloc[-1].timestamp() < state.get("paused_until", 0):
         logger.info("Сигнал на покупку пропущен: пауза после серии убытков")
         return None
-    if cfg.trend_ema > 0:
-        ema = compute_ema(closed["close"], cfg.trend_ema).iloc[-1]
-        if pd.isna(ema) or closed["close"].iloc[-1] <= ema:
-            logger.info("Сигнал на покупку пропущен: цена ниже EMA(%d) — нисходящий тренд",
-                        cfg.trend_ema)
-            return None
-    return {"side": "buy", "price": last_price, "reason": f"RSI={rsi.iloc[-1]:.1f}"}
+    if not trend_mask(closed, cfg)[-1]:
+        logger.info("Сигнал на покупку пропущен: цена ниже EMA(%d) — нисходящий тренд",
+                    cfg.trend_ema)
+        return None
+    return {"side": "buy", "price": last_price, "reason": reason}
 
 
 def process_candles(df: pd.DataFrame, state: dict, cfg: Config, trader: Trader) -> dict:
@@ -419,11 +491,11 @@ def run(cfg: Config) -> None:
     cfg.validate()
     exchange = make_exchange(cfg)
     trader = Trader(cfg, exchange)
-    notify(cfg, f"🤖 RSI-бот запущен: {cfg.symbol} {cfg.timeframe}, режим {cfg.mode}, "
-                f"RSI({cfg.rsi_period}) {cfg.rsi_buy}/{cfg.rsi_sell}, ордер {cfg.order_usdt} USDT")
+    notify(cfg, f"🤖 Бот запущен: {cfg.symbol} {cfg.timeframe}, режим {cfg.mode}, "
+                f"{describe(cfg)}, ордер {cfg.order_usdt} USDT")
     while True:
         try:
-            limit = min(1000, max(cfg.rsi_period * 20, cfg.trend_ema * 3))
+            limit = min(1000, max(300, cfg.trend_ema * 3, cfg.slow_ema * 3))
             df = fetch_candles(exchange, cfg.symbol, cfg.timeframe, limit=limit)
             # Перечитываем файл: в режиме signals его меняют команды confirm/reject.
             state = load_state(cfg.state_file)
@@ -443,27 +515,28 @@ def run(cfg: Config) -> None:
 # Бэктест
 # --------------------------------------------------------------------------- #
 
-def backtest(df: pd.DataFrame, cfg: Config, rsi: np.ndarray | None = None,
-             ema: np.ndarray | None = None) -> dict:
-    """Симуляция той же логики, что и в живом режиме, на закрытых свечах.
+def backtest(df: pd.DataFrame, cfg: Config,
+             signals: tuple[np.ndarray, np.ndarray] | None = None,
+             trend: np.ndarray | None = None, start: int = 1, end: int | None = None) -> dict:
+    """Симуляция той же логики, что и в живом режиме, на свечах df[start:end].
 
-    Вход и выход по RSI — по цене закрытия; стоп/трейлинг/тейк — по high/low
-    (при гэпе — по цене открытия). Если стоп и тейк задеты одной свечой, считаем
-    стоп (консервативно). Комиссия FEE_RATE на каждую сторону.
+    Вход и выход по сигналу стратегии — по цене закрытия; стоп/трейлинг/тейк —
+    по high/low (при гэпе — по цене открытия). Если стоп и тейк задеты одной
+    свечой, считаем стоп (консервативно). Комиссия FEE_RATE на каждую сторону.
+    signals/trend можно передать заранее посчитанными по всей истории.
     """
+    end = len(df) if end is None else end
+    start = max(start, 1)
     close, high = df["close"].to_numpy(float), df["high"].to_numpy(float)
     low, opn = df["low"].to_numpy(float), df["open"].to_numpy(float)
-    if rsi is None:
-        rsi = compute_rsi(df["close"], cfg.rsi_period).to_numpy()
-    if ema is None and cfg.trend_ema > 0:
-        ema = compute_ema(df["close"], cfg.trend_ema).to_numpy()
+    entries, exits = signals if signals is not None else strategy_signals(df, cfg)[:2]
+    trend = trend_mask(df, cfg) if trend is None else trend
     bar_seconds = (df["ts"].iloc[1] - df["ts"].iloc[0]).total_seconds() if len(df) > 1 else 60
     pause_bars = math.ceil(cfg.pause_hours * 3600 / bar_seconds)
 
     equity = peak_equity = cfg.order_usdt
     max_dd, pos, trades, streak, paused_until = 0.0, None, [], 0, -1
-    for i in range(1, len(df)):
-        sig = rsi_signal(rsi[i - 1], rsi[i], cfg.rsi_buy, cfg.rsi_sell)
+    for i in range(start, end):
         if pos:
             stop, _ = stop_price(pos["entry"], pos["peak"], cfg)
             tp = pos["entry"] * (1 + cfg.take_profit_pct / 100) if cfg.take_profit_pct > 0 else None
@@ -472,7 +545,7 @@ def backtest(df: pd.DataFrame, cfg: Config, rsi: np.ndarray | None = None,
                 exit_price = min(stop, opn[i])
             elif tp is not None and high[i] >= tp:
                 exit_price = max(tp, opn[i])
-            elif sig == "sell":
+            elif exits[i]:
                 exit_price = close[i]
             if exit_price is not None:
                 equity = pos["amount"] * exit_price * (1 - FEE_RATE)
@@ -484,15 +557,14 @@ def backtest(df: pd.DataFrame, cfg: Config, rsi: np.ndarray | None = None,
                 pos = None
             else:
                 pos["peak"] = max(pos["peak"], high[i])
-        elif (sig == "buy" and i > paused_until
-              and (ema is None or cfg.trend_ema <= 0 or (not np.isnan(ema[i]) and close[i] > ema[i]))):
+        elif entries[i] and trend[i] and i > paused_until:
             pos = {"entry": close[i], "peak": close[i], "cost": equity,
                    "amount": equity * (1 - FEE_RATE) / close[i]}
         mark = pos["amount"] * close[i] if pos else equity
         peak_equity = max(peak_equity, mark)
         max_dd = max(max_dd, 1 - mark / peak_equity)
-    if pos:  # закрываем открытую позицию по последней цене
-        equity = pos["amount"] * close[-1] * (1 - FEE_RATE)
+    if pos:  # закрываем открытую позицию по последней цене отрезка
+        equity = pos["amount"] * close[end - 1] * (1 - FEE_RATE)
         trades.append(equity / pos["cost"] - 1)
     gains = sum(t for t in trades if t > 0)
     losses = -sum(t for t in trades if t < 0)
@@ -502,7 +574,7 @@ def backtest(df: pd.DataFrame, cfg: Config, rsi: np.ndarray | None = None,
         "return_pct": (equity / cfg.order_usdt - 1) * 100,
         "max_drawdown_pct": max_dd * 100,
         "profit_factor": gains / losses if losses else (math.inf if gains else 0.0),
-        "buy_and_hold_pct": (close[-1] / close[0] - 1) * 100,
+        "buy_and_hold_pct": (close[end - 1] / close[start - 1] - 1) * 100,
     }
 
 
@@ -525,12 +597,35 @@ def fetch_history(exchange, symbol: str, timeframe: str, candles: int) -> pd.Dat
     return df
 
 
+STRATEGY_PARAMS = {
+    "rsi": ("rsi_buy", "rsi_sell"),
+    "ema_cross": ("fast_ema", "slow_ema"),
+    "donchian": ("channel_entry", "channel_exit"),
+    "bollinger": ("bb_period", "bb_std"),
+    "macd": (),
+}
+
+
 def describe(cfg: Config) -> str:
-    parts = [f"RSI({cfg.rsi_period}) {cfg.rsi_buy:g}/{cfg.rsi_sell:g}",
-             f"SL {cfg.stop_loss_pct:g}%", f"TP {cfg.take_profit_pct:g}%" if cfg.take_profit_pct else "TP выкл",
+    strat = {
+        "rsi": f"RSI({cfg.rsi_period}) {cfg.rsi_buy:g}/{cfg.rsi_sell:g}",
+        "ema_cross": f"EMA {cfg.fast_ema}/{cfg.slow_ema}",
+        "donchian": f"Donchian {cfg.channel_entry}/{cfg.channel_exit}",
+        "bollinger": f"Bollinger {cfg.bb_period}, {cfg.bb_std:g}σ",
+        "macd": "MACD 12/26/9",
+    }[cfg.strategy]
+    parts = [strat,
+             f"SL {cfg.stop_loss_pct:g}%" if cfg.stop_loss_pct else "SL выкл",
+             f"TP {cfg.take_profit_pct:g}%" if cfg.take_profit_pct else "TP выкл",
              f"трейлинг {cfg.trailing_pct:g}%" if cfg.trailing_pct else "трейлинг выкл",
              f"EMA{cfg.trend_ema}" if cfg.trend_ema else "без фильтра тренда"]
     return ", ".join(parts)
+
+
+def env_line(cfg: Config) -> str:
+    keys = ("strategy",) + STRATEGY_PARAMS[cfg.strategy] + (
+        "stop_loss_pct", "take_profit_pct", "trailing_pct", "trend_ema", "timeframe")
+    return " ".join(f"{k.upper()}={getattr(cfg, k)}" for k in keys)
 
 
 def format_result(res: dict) -> str:
@@ -550,76 +645,118 @@ def run_backtest(cfg: Config, candles: int) -> None:
     print(format_result(backtest(df, cfg)))
 
 
-OPTIMIZE_GRID = {
-    "rsi_buy": [25, 30, 35],
-    "rsi_sell": [60, 65, 70, 75],
-    "stop_loss_pct": [2, 3, 5],
-    "take_profit_pct": [0, 4, 8],
-    "trailing_pct": [0, 2, 4],
+STRATEGY_GRIDS = {
+    "rsi": {"rsi_buy": [25, 30, 35], "rsi_sell": [60, 70, 75]},
+    "ema_cross": {"fast_ema": [10, 20, 50], "slow_ema": [50, 100, 200]},
+    "donchian": {"channel_entry": [20, 55], "channel_exit": [10, 20]},
+    "bollinger": {"bb_period": [20, 40], "bb_std": [2.0, 2.5]},
+    "macd": {},
+}
+RISK_GRID = {
+    "stop_loss_pct": [0, 3, 6],
+    "take_profit_pct": [0, 6, 12],
+    "trailing_pct": [0, 3, 6],
     "trend_ema": [0, 200],
 }
 
 
-def optimize(df: pd.DataFrame, cfg: Config, train_share: float = 0.7, min_trades: int = 5) -> dict:
-    """Walk-forward: подбор параметров на первой части истории, проверка на второй.
+def _grid(grid: dict) -> list[dict]:
+    return [dict(zip(grid, v)) for v in itertools.product(*grid.values())]
 
-    Результат на тестовом отрезке — честная оценка: эти свечи при подборе не
-    использовались. Хороший результат только на обучающем отрезке — подгонка.
+
+def walk_forward(df: pd.DataFrame, cfg: Config, strategy: str, folds: int = 3,
+                 min_trades: int = 5) -> dict:
+    """Walk-forward проверка стратегии.
+
+    История делится на folds+1 равных частей. На шаге k параметры подбираются
+    по всем данным до части k, а результат считается на части k — данных,
+    которые при подборе не использовались. Итог по тестовым частям — честная
+    оценка «как бы бот торговал вживую». Высокий результат только на обучении —
+    это подгонка под историю.
     """
-    split = int(len(df) * train_share)
-    train, test = df.iloc[:split].reset_index(drop=True), df.iloc[split:].reset_index(drop=True)
-    rsi_train = compute_rsi(train["close"], cfg.rsi_period).to_numpy()
-    ema_train = {p: compute_ema(train["close"], p).to_numpy() for p in OPTIMIZE_GRID["trend_ema"] if p}
-    results = []
-    keys = list(OPTIMIZE_GRID)
-    for values in itertools.product(*OPTIMIZE_GRID.values()):
-        params = dict(zip(keys, values))
-        if params["rsi_buy"] >= params["rsi_sell"]:
+    base = Config(**{**cfg.__dict__, "strategy": strategy})
+    strat_combos = [c for c in _grid(STRATEGY_GRIDS[strategy])
+                    if not (strategy == "ema_cross" and c["fast_ema"] >= c["slow_ema"])
+                    and not (strategy == "rsi" and c["rsi_buy"] >= c["rsi_sell"])]
+    signals = {}
+    for sc in strat_combos:
+        signals[tuple(sc.items())] = strategy_signals(df, Config(**{**base.__dict__, **sc}))[:2]
+    trends = {t: trend_mask(df, Config(**{**base.__dict__, "trend_ema": t}))
+              for t in RISK_GRID["trend_ema"]}
+    risk_combos = _grid(RISK_GRID)
+
+    chunk = len(df) // (folds + 1)
+    fold_results, growth = [], 1.0
+    for k in range(1, folds + 1):
+        train_end, test_end = k * chunk, (k + 1) * chunk if k < folds else len(df)
+        best = None
+        for sc in strat_combos:
+            sig = signals[tuple(sc.items())]
+            for rc in risk_combos:
+                c = Config(**{**base.__dict__, **sc, **rc})
+                res = backtest(df, c, sig, trends[c.trend_ema], start=1, end=train_end)
+                if res["trades"] < min_trades:
+                    continue
+                score = res["return_pct"] - 0.5 * res["max_drawdown_pct"]
+                if best is None or score > best[0]:
+                    best = (score, c, res)
+        if best is None:  # нечего торговать — остаёмся в деньгах
+            fold_results.append({"cfg": None, "train": None, "test": None,
+                                 "period": (df["ts"].iloc[train_end], df["ts"].iloc[test_end - 1])})
             continue
-        c = Config(**{**cfg.__dict__, **params})
-        res = backtest(train, c, rsi_train, ema_train.get(c.trend_ema))
-        if res["trades"] >= min_trades:
-            # Доходность с штрафом за просадку: предпочитаем более ровную кривую.
-            results.append((res["return_pct"] - 0.5 * res["max_drawdown_pct"], params, res))
-    if not results:
-        raise ValueError("Слишком мало сделок на обучающем отрезке — возьмите больше свечей")
-    results.sort(key=lambda r: r[0], reverse=True)
-    _, best_params, best_train = results[0]
-    best_cfg = Config(**{**cfg.__dict__, **best_params})
-    # Тест: индикаторы считаем по всей истории, чтобы EMA/RSI были «прогреты», а сделки — только на тесте.
-    full_rsi = compute_rsi(df["close"], cfg.rsi_period).to_numpy()[split:]
-    full_ema = compute_ema(df["close"], best_cfg.trend_ema).to_numpy()[split:] if best_cfg.trend_ema else None
-    base_rsi_ema = compute_ema(df["close"], cfg.trend_ema).to_numpy()[split:] if cfg.trend_ema else None
+        _, c, train_res = best
+        sig = signals[tuple((key, getattr(c, key)) for key in STRATEGY_GRIDS[strategy])]
+        test_res = backtest(df, c, sig, trends[c.trend_ema], start=train_end, end=test_end)
+        growth *= 1 + test_res["return_pct"] / 100
+        fold_results.append({"cfg": c, "train": train_res, "test": test_res,
+                             "period": (df["ts"].iloc[train_end], df["ts"].iloc[test_end - 1])})
+    tested = [f for f in fold_results if f["test"]]
+    last_cfg = next((f["cfg"] for f in reversed(fold_results) if f["cfg"]), None)
     return {
-        "train_period": (train["ts"].iloc[0], train["ts"].iloc[-1]),
-        "test_period": (test["ts"].iloc[0], test["ts"].iloc[-1]),
-        "best_params": best_params,
-        "best_cfg": best_cfg,
-        "train": best_train,
-        "test": backtest(test, best_cfg, full_rsi, full_ema),
-        "baseline_test": backtest(test, cfg, full_rsi, base_rsi_ema),
-        "tested": len(results),
+        "strategy": strategy,
+        "folds": fold_results,
+        "oos_return_pct": (growth - 1) * 100,
+        "oos_max_drawdown_pct": max((f["test"]["max_drawdown_pct"] for f in tested), default=0.0),
+        "oos_trades": sum(f["test"]["trades"] for f in tested),
+        "positive_folds": sum(f["test"]["return_pct"] > 0 for f in tested),
+        "buy_and_hold_pct": (df["close"].iloc[-1] / df["close"].iloc[chunk - 1] - 1) * 100,
+        "last_cfg": last_cfg,
+        "combos": len(strat_combos) * len(risk_combos),
     }
 
 
-def run_optimize(cfg: Config, candles: int) -> None:
+def run_optimize(cfg: Config, candles: int, strategy: str, folds: int) -> None:
     exchange = make_exchange(Config(symbol=cfg.symbol, mode="paper"))
     df = fetch_history(exchange, cfg.symbol, cfg.timeframe, candles)
-    r = optimize(df, cfg)
-    fmt = lambda p: f"{p[0]:%Y-%m-%d} — {p[1]:%Y-%m-%d}"
-    print(f"Оптимизация {cfg.symbol} {cfg.timeframe}: проверено {r['tested']} комбинаций")
-    print(f"Обучение {fmt(r['train_period'])}, тест {fmt(r['test_period'])}\n")
-    print(f"Лучшие параметры: {describe(r['best_cfg'])}")
-    print(f"  обучение: {format_result(r['train'])}")
-    print(f"  ТЕСТ:     {format_result(r['test'])}")
-    print(f"\nТекущие параметры ({describe(cfg)}) на тесте:\n  {format_result(r['baseline_test'])}")
-    b = r["best_params"]
-    print("\nЧтобы использовать лучшие параметры:")
-    print(f"  RSI_BUY={b['rsi_buy']} RSI_SELL={b['rsi_sell']} STOP_LOSS_PCT={b['stop_loss_pct']} "
-          f"TAKE_PROFIT_PCT={b['take_profit_pct']} TRAILING_PCT={b['trailing_pct']} "
-          f"TREND_EMA={b['trend_ema']} TIMEFRAME={cfg.timeframe}")
-    if r["test"]["return_pct"] <= 0:
-        print("\n⚠️ На тестовом отрезке стратегия убыточна — не запускайте её на реальные деньги.")
+    names = STRATEGIES if strategy == "all" else (strategy,)
+    print(f"Walk-forward {cfg.symbol} {cfg.timeframe}: {len(df)} свечей "
+          f"({df['ts'].iloc[0]:%Y-%m-%d} — {df['ts'].iloc[-1]:%Y-%m-%d}), {folds} тестовых отрезка\n")
+    results = []
+    for name in names:
+        r = walk_forward(df, cfg, name, folds)
+        results.append(r)
+        print(f"== {name} ({r['combos']} комбинаций на отрезок)")
+        for i, f in enumerate(r["folds"], 1):
+            per = f"{f['period'][0]:%Y-%m-%d} — {f['period'][1]:%Y-%m-%d}"
+            if not f["test"]:
+                print(f"  тест {i} ({per}): мало сделок на обучении — не торгуем")
+                continue
+            print(f"  тест {i} ({per}): {describe(f['cfg'])}")
+            print(f"     {format_result(f['test'])}")
+        print(f"  ИТОГО на новых данных: {r['oos_return_pct']:+.2f}%, сделок {r['oos_trades']}, "
+              f"плюсовых отрезков {r['positive_folds']}/{folds}, "
+              f"худшая просадка {r['oos_max_drawdown_pct']:.1f}% "
+              f"(купить и держать {r['buy_and_hold_pct']:+.2f}%)\n")
+    ok = [r for r in results if r["oos_return_pct"] > 0 and r["positive_folds"] >= folds - 1
+          and r["last_cfg"]]
+    if not ok:
+        print("⚠️ Ни одна стратегия не была стабильно прибыльной на новых данных для "
+              f"{cfg.symbol} {cfg.timeframe} — не торгуйте её на реальные деньги.")
+        return
+    best = max(ok, key=lambda r: r["oos_return_pct"])
+    print(f"Лучшая устойчивая стратегия: {best['strategy']} "
+          f"({best['oos_return_pct']:+.2f}% на новых данных). Параметры последнего отрезка:")
+    print(f"  {env_line(best['last_cfg'])}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -629,7 +766,10 @@ def main(argv: list[str] | None = None) -> None:
     p_bt = sub.add_parser("backtest", help="прогнать стратегию на истории")
     p_bt.add_argument("--candles", type=int, default=1000)
     p_opt = sub.add_parser("optimize", help="подобрать параметры с проверкой на новых данных")
-    p_opt.add_argument("--candles", type=int, default=5000)
+    p_opt.add_argument("--candles", type=int, default=6000)
+    p_opt.add_argument("--strategy", default=None, help="rsi, ema_cross, donchian, bollinger, "
+                       "macd или all (по умолчанию — STRATEGY)")
+    p_opt.add_argument("--folds", type=int, default=3)
     sub.add_parser("signals", help="показать ожидающие сигналы и позицию (JSON)")
     p_confirm = sub.add_parser("confirm", help="записать сигнал, исполненный через MCP")
     p_confirm.add_argument("id")
@@ -645,7 +785,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "backtest":
         run_backtest(config, args.candles)
     elif args.command == "optimize":
-        run_optimize(config, args.candles)
+        run_optimize(config, args.candles, args.strategy or config.strategy, args.folds)
     elif args.command in ("signals", "confirm", "reject"):
         state = load_state(config.state_file)
         if args.command == "signals":
