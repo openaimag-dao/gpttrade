@@ -40,7 +40,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +58,9 @@ def _env_float(name: str, default: float) -> float:
 @dataclass
 class Config:
     symbol: str = os.getenv("SYMBOL", "BTC/USDT")
+    # Портфель: несколько пар через запятую, например "BTC/USDT,ETH/USDT,SOL/USDT".
+    # У каждой пары своя позиция, свой файл состояния и свой ордер ORDER_USDT.
+    symbols: str = os.getenv("SYMBOLS", "")
     timeframe: str = os.getenv("TIMEFRAME", "1h")
     strategy: str = os.getenv("STRATEGY", "rsi").lower()
     rsi_period: int = int(os.getenv("RSI_PERIOD", 14))
@@ -90,6 +93,19 @@ class Config:
     api_secret: str = field(default_factory=lambda: os.getenv("BINANCE_API_SECRET", ""))
     telegram_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
+
+    def symbol_list(self) -> list[str]:
+        if not self.symbols.strip():
+            return [self.symbol]
+        return [x.strip().upper() for x in self.symbols.split(",") if x.strip()]
+
+    def for_symbol(self, symbol: str) -> "Config":
+        """Настройки для одной пары портфеля: свой SYMBOL и свой файл состояния."""
+        if len(self.symbol_list()) == 1:
+            return replace(self, symbol=symbol, symbols="")
+        path = self.state_file
+        state_file = path.with_name(f"{path.stem}_{symbol.replace('/', '-')}{path.suffix}")
+        return replace(self, symbol=symbol, symbols="", state_file=state_file)
 
     def validate(self) -> None:
         if self.mode not in ("paper", "signals", "testnet", "live"):
@@ -424,6 +440,7 @@ def process_signals(df: pd.DataFrame, state: dict, cfg: Config, now: float | Non
         "side": decision["side"],
         "symbol": cfg.symbol,
         "mcp_symbol": cfg.symbol.replace("/", ""),
+        "timeframe": cfg.timeframe,
         "price": decision["price"],
         "reason": decision["reason"],
         "created": now,
@@ -490,24 +507,30 @@ def _close(state: dict, cfg: Config, trader: Trader, price: float, reason: str) 
 def run(cfg: Config) -> None:
     cfg.validate()
     exchange = make_exchange(cfg)
-    trader = Trader(cfg, exchange)
-    notify(cfg, f"🤖 Бот запущен: {cfg.symbol} {cfg.timeframe}, режим {cfg.mode}, "
-                f"{describe(cfg)}, ордер {cfg.order_usdt} USDT")
+    configs = [cfg.for_symbol(sym) for sym in cfg.symbol_list()]
+    for c in configs:
+        if c.symbol not in exchange.markets:
+            raise ValueError(f"Пара {c.symbol} не найдена на Binance")
+    traders = {c.symbol: Trader(c, exchange) for c in configs}
+    pairs = ", ".join(c.symbol for c in configs)
+    notify(cfg, f"🤖 Бот запущен: {pairs} {cfg.timeframe}, режим {cfg.mode}, "
+                f"{describe(cfg)}, ордер {cfg.order_usdt} USDT на каждую пару")
+    limit = min(1000, max(300, cfg.trend_ema * 3, cfg.slow_ema * 3))
     while True:
-        try:
-            limit = min(1000, max(300, cfg.trend_ema * 3, cfg.slow_ema * 3))
-            df = fetch_candles(exchange, cfg.symbol, cfg.timeframe, limit=limit)
-            # Перечитываем файл: в режиме signals его меняют команды confirm/reject.
-            state = load_state(cfg.state_file)
-            if cfg.mode == "signals":
-                state = process_signals(df, state, cfg)
-            else:
-                state = process_candles(df, state, cfg, trader)
-            save_state(cfg.state_file, state)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:  # сеть, лимиты API и т.п. — повторяем позже
-            logger.exception("Ошибка шага: %s", exc)
+        for c in configs:
+            try:
+                df = fetch_candles(exchange, c.symbol, c.timeframe, limit=limit)
+                # Перечитываем файл: в режиме signals его меняют команды confirm/reject.
+                state = load_state(c.state_file)
+                if c.mode == "signals":
+                    state = process_signals(df, state, c)
+                else:
+                    state = process_candles(df, state, c, traders[c.symbol])
+                save_state(c.state_file, state)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # сеть, лимиты API и т.п. — повторяем позже
+                logger.exception("Ошибка шага %s: %s", c.symbol, exc)
         time.sleep(cfg.poll_seconds)
 
 
@@ -536,6 +559,7 @@ def backtest(df: pd.DataFrame, cfg: Config,
 
     equity = peak_equity = cfg.order_usdt
     max_dd, pos, trades, streak, paused_until = 0.0, None, [], 0, -1
+    curve = np.empty(end - start)
     for i in range(start, end):
         if pos:
             stop, _ = stop_price(pos["entry"], pos["peak"], cfg)
@@ -561,11 +585,14 @@ def backtest(df: pd.DataFrame, cfg: Config,
             pos = {"entry": close[i], "peak": close[i], "cost": equity,
                    "amount": equity * (1 - FEE_RATE) / close[i]}
         mark = pos["amount"] * close[i] if pos else equity
+        curve[i - start] = mark
         peak_equity = max(peak_equity, mark)
         max_dd = max(max_dd, 1 - mark / peak_equity)
     if pos:  # закрываем открытую позицию по последней цене отрезка
         equity = pos["amount"] * close[end - 1] * (1 - FEE_RATE)
         trades.append(equity / pos["cost"] - 1)
+        if len(curve):
+            curve[-1] = equity  # кривая заканчивается тем же капиталом, что и итог
     gains = sum(t for t in trades if t > 0)
     losses = -sum(t for t in trades if t < 0)
     return {
@@ -575,6 +602,7 @@ def backtest(df: pd.DataFrame, cfg: Config,
         "max_drawdown_pct": max_dd * 100,
         "profit_factor": gains / losses if losses else (math.inf if gains else 0.0),
         "buy_and_hold_pct": (close[end - 1] / close[start - 1] - 1) * 100,
+        "equity_curve": curve,  # стоимость позиции/кэша на каждой свече отрезка
     }
 
 
@@ -643,6 +671,61 @@ def run_backtest(cfg: Config, candles: int) -> None:
           f"({df['ts'].iloc[0]:%Y-%m-%d} — {df['ts'].iloc[-1]:%Y-%m-%d})")
     print(describe(cfg))
     print(format_result(backtest(df, cfg)))
+
+
+def max_drawdown(curve: np.ndarray) -> float:
+    return float((1 - curve / np.maximum.accumulate(curve)).max() * 100) if len(curve) else 0.0
+
+
+def portfolio_backtest(frames: dict[str, pd.DataFrame], cfg: Config) -> dict:
+    """Бэктест портфеля: каждой паре — своя равная доля (ORDER_USDT), торгуют независимо.
+
+    Сравнение идёт на общем периоде, когда торговались все пары; индикаторы
+    считаются по всей истории каждой пары, чтобы к началу периода они были «прогреты».
+    """
+    start_ts = max(df["ts"].iloc[0] for df in frames.values())
+    end_ts = min(df["ts"].iloc[-1] for df in frames.values())
+    per_symbol, curves, holds = {}, [], []
+    for sym, df in frames.items():
+        c = cfg.for_symbol(sym)
+        start = max(1, int(df["ts"].searchsorted(start_ts)))
+        end = int(df["ts"].searchsorted(end_ts, side="right"))
+        res = backtest(df, c, start=start, end=end)
+        per_symbol[sym] = res
+        curves.append(res["equity_curve"])
+        closes = df["close"].to_numpy(float)[start - 1:end]
+        holds.append(cfg.order_usdt * closes[1:] / closes[0])
+    n = min(len(x) for x in curves)
+    total = sum(x[-n:] for x in curves)
+    hold = sum(x[-n:] for x in holds)
+    capital = cfg.order_usdt * len(frames)
+    return {
+        "period": (start_ts, end_ts),
+        "per_symbol": per_symbol,
+        "return_pct": (total[-1] / capital - 1) * 100,
+        "max_drawdown_pct": max_drawdown(np.concatenate([[capital], total])),
+        "trades": sum(r["trades"] for r in per_symbol.values()),
+        "buy_and_hold_pct": (hold[-1] / capital - 1) * 100,
+        "buy_and_hold_drawdown_pct": max_drawdown(np.concatenate([[capital], hold])),
+    }
+
+
+def run_portfolio(cfg: Config, candles: int) -> None:
+    symbols = cfg.symbol_list()
+    if len(symbols) < 2:
+        raise ValueError("Для портфеля задайте SYMBOLS, например BTC/USDT,ETH/USDT,SOL/USDT")
+    exchange = make_exchange(Config(mode="paper"))
+    frames = {sym: fetch_history(exchange, sym, cfg.timeframe, candles) for sym in symbols}
+    r = portfolio_backtest(frames, cfg)
+    print(f"Портфель {len(symbols)} пар, {cfg.timeframe}, {describe(cfg)}")
+    print(f"Период {r['period'][0]:%Y-%m-%d} — {r['period'][1]:%Y-%m-%d}, "
+          f"по {cfg.order_usdt:g} USDT на пару\n")
+    for sym, res in r["per_symbol"].items():
+        print(f"  {sym:10} {format_result(res)}")
+    print(f"\nПОРТФЕЛЬ: доходность {r['return_pct']:+.2f}%, макс. просадка "
+          f"{r['max_drawdown_pct']:.1f}%, сделок {r['trades']}")
+    print(f"Купить и держать те же пары: {r['buy_and_hold_pct']:+.2f}%, "
+          f"просадка {r['buy_and_hold_drawdown_pct']:.1f}%")
 
 
 STRATEGY_GRIDS = {
@@ -770,7 +853,9 @@ def main(argv: list[str] | None = None) -> None:
     p_opt.add_argument("--strategy", default=None, help="rsi, ema_cross, donchian, bollinger, "
                        "macd или all (по умолчанию — STRATEGY)")
     p_opt.add_argument("--folds", type=int, default=3)
-    sub.add_parser("signals", help="показать ожидающие сигналы и позицию (JSON)")
+    p_pf = sub.add_parser("portfolio", help="бэктест портфеля из пар SYMBOLS")
+    p_pf.add_argument("--candles", type=int, default=3000)
+    sub.add_parser("signals", help="показать ожидающие сигналы и позиции (JSON)")
     p_confirm = sub.add_parser("confirm", help="записать сигнал, исполненный через MCP")
     p_confirm.add_argument("id")
     p_confirm.add_argument("--price", type=float, required=True, help="средняя цена исполнения")
@@ -786,23 +871,31 @@ def main(argv: list[str] | None = None) -> None:
         run_backtest(config, args.candles)
     elif args.command == "optimize":
         run_optimize(config, args.candles, args.strategy or config.strategy, args.folds)
-    elif args.command in ("signals", "confirm", "reject"):
-        state = load_state(config.state_file)
-        if args.command == "signals":
-            expire_signals(state, config)
-            print(json.dumps({"symbol": config.symbol, "position": state["position"],
-                              "realized_pnl": state["realized_pnl"],
-                              "pending": [s for s in state.get("signals", [])
-                                          if s["status"] == "pending"]},
-                             indent=2, ensure_ascii=False))
-            return
+    elif args.command == "portfolio":
+        run_portfolio(config, args.candles)
+    elif args.command == "signals":
+        report = {"pairs": [], "pending": []}
+        for c in (config.for_symbol(sym) for sym in config.symbol_list()):
+            state = load_state(c.state_file)
+            expire_signals(state, c)
+            report["pairs"].append({"symbol": c.symbol, "position": state["position"],
+                                    "realized_pnl": state["realized_pnl"]})
+            report["pending"] += [s for s in state.get("signals", []) if s["status"] == "pending"]
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    elif args.command in ("confirm", "reject"):
+        for c in (config.for_symbol(sym) for sym in config.symbol_list()):
+            state = load_state(c.state_file)
+            if any(s["id"] == args.id for s in state.get("signals", [])):
+                break
+        else:
+            raise ValueError(f"Сигнал {args.id} не найден")
         if args.command == "confirm":
-            state = confirm_signal(state, args.id, args.price, args.amount, args.quote, config)
+            state = confirm_signal(state, args.id, args.price, args.amount, args.quote, c)
         else:
             state = reject_signal(state, args.id)
-        save_state(config.state_file, state)
+        save_state(c.state_file, state)
         status = next(s["status"] for s in state["signals"] if s["id"] == args.id)
-        print(f"Сигнал {args.id}: {status}")
+        print(f"Сигнал {args.id} ({c.symbol}): {status}")
     else:
         run(config)
 

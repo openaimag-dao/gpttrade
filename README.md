@@ -82,6 +82,7 @@ nohup python3 crypto_macro_bot.py > bot.log 2>&1 &
 | Переменная | По умолчанию | Описание |
 |---|---|---|
 | `SYMBOL` | `BTC/USDT` | Торговая пара |
+| `SYMBOLS` | — | Портфель: несколько пар через запятую (`BTC/USDT,ETH/USDT,…`). Каждая пара торгуется отдельно на `ORDER_USDT` |
 | `STRATEGY` | `rsi` | `rsi`, `ema_cross`, `donchian`, `bollinger`, `macd` (см. «Стратегии») |
 | `FAST_EMA` / `SLOW_EMA` | `20` / `100` | Периоды EMA для `ema_cross` |
 | `CHANNEL_ENTRY` / `CHANNEL_EXIT` | `20` / `10` | Каналы Дончиана для `donchian` |
@@ -180,13 +181,41 @@ python3 rsi_bot.py optimize --strategy all --candles 6000 --folds 3
 | XRP | +66% | 85% | 20% | +333% | 83% |
 | ADA | +2614% | 63% | 39% | +65% | 95% |
 
-#### Рекомендуемая настройка
+#### Рекомендуемая настройка: портфель из нескольких монет
+
+Одна монета может месяцами падать или стоять. Если разделить сумму поровну
+между несколькими монетами, их тренды случаются в разное время, и общая
+просадка заметно меньше. Каждая пара торгуется независимо, на `ORDER_USDT`:
 
 ```bash
 STRATEGY=ema_cross FAST_EMA=10 SLOW_EMA=50 TIMEFRAME=1d \
   STOP_LOSS_PCT=0 TAKE_PROFIT_PCT=0 TRAILING_PCT=0 TREND_EMA=0 MAX_LOSS_STREAK=0 \
-  MODE=signals python3 rsi_bot.py
+  SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,ADA/USDT ORDER_USDT=25 \
+  SIGNAL_TTL_MINUTES=720 MODE=signals python3 rsi_bot.py
 ```
+
+`SIGNAL_TTL_MINUTES=720` — сигнал дневной стратегии появляется в 00:00 UTC и
+ждёт подтверждения 12 часов. Бэктест того же портфеля:
+
+```bash
+SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,ADA/USDT ORDER_USDT=25 \
+  STRATEGY=ema_cross FAST_EMA=10 SLOW_EMA=50 TIMEFRAME=1d STOP_LOSS_PCT=0 \
+  TAKE_PROFIT_PCT=0 TREND_EMA=0 MAX_LOSS_STREAK=0 python3 rsi_bot.py portfolio --candles 1150
+```
+
+Результаты портфеля из 6 монет (EMA 10/50, 1d, по 25 USDT на монету):
+
+| Период | Портфель | его просадка | Купить и держать | его просадка |
+|---|---|---|---|---|
+| 2020-08 — 2026-10 | +2525% | 53% | +1278% | 85% |
+| 2023-08 — 2026-10 (3 года) | +97% | **35%** | +170% | 65% |
+| 2025-02 — 2026-10 (рынок вниз) | **+16%** | 33% | −22% | 65% |
+
+Портфель не всегда зарабатывает больше рынка: за последние 3 года «купить и
+держать» дал больше. Но просадка в портфеле **примерно вдвое меньше**, а в
+падающем рынке он остаётся в плюсе. Честные оговорки: монеты выбраны из тех,
+что сейчас в топе (выжившие), а параметры EMA 10/50 найдены на этой же
+истории — реальные результаты, скорее всего, будут скромнее.
 
 Чего ждать от трендовой стратегии:
 
@@ -255,7 +284,7 @@ Binance и при сигнале присылает уведомление (в �
 Команды для ручной работы с сигналами:
 
 ```bash
-python3 rsi_bot.py signals                       # ожидающие сигналы и позиция (JSON)
+python3 rsi_bot.py signals                       # ожидающие сигналы и позиции всех пар (JSON)
 python3 rsi_bot.py confirm <id> --price 64000 --amount 0.000312 --quote 20
 python3 rsi_bot.py reject <id>
 ```

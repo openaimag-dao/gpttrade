@@ -296,3 +296,48 @@ class PagedExchange:
 def test_fetch_history_pages_past_1000():
     df = rsi_bot.fetch_history(PagedExchange(2500), "BTC/USDT", "1m", 2500)
     assert len(df) == 2500 and df["ts"].is_monotonic_increasing
+
+
+# ------------------------------- портфель --------------------------------- #
+
+def test_portfolio_configs_get_separate_state_files(tmp_path):
+    cfg = Config(symbols="BTC/USDT, eth/usdt", state_file=tmp_path / "state.json")
+    assert cfg.symbol_list() == ["BTC/USDT", "ETH/USDT"]
+    eth = cfg.for_symbol("ETH/USDT")
+    assert eth.symbol == "ETH/USDT" and eth.state_file == tmp_path / "state_ETH-USDT.json"
+    single = Config(symbol="SOL/USDT", state_file=tmp_path / "state.json")
+    assert single.symbol_list() == ["SOL/USDT"]
+    assert single.for_symbol("SOL/USDT").state_file == tmp_path / "state.json"  # как раньше
+
+
+def test_portfolio_backtest_sums_equal_shares():
+    rng = np.random.default_rng(6)
+    frames = {"AAA/USDT": make_df(100 * np.exp(rng.normal(0, 0.01, 1200).cumsum())),
+              "BBB/USDT": make_df(50 * np.exp(rng.normal(0, 0.01, 1200).cumsum()))}
+    cfg = Config(strategy="ema_cross", fast_ema=10, slow_ema=50, trend_ema=0, order_usdt=10)
+    r = rsi_bot.portfolio_backtest(frames, cfg)
+    per = r["per_symbol"]
+    expected = (sum(10 * (1 + x["return_pct"] / 100) for x in per.values()) / 20 - 1) * 100
+    assert r["return_pct"] == pytest.approx(expected)
+    assert r["trades"] == sum(x["trades"] for x in per.values())
+    assert 0 <= r["max_drawdown_pct"] <= 100
+
+
+def test_cli_portfolio_signals_and_confirm(tmp_path, monkeypatch, capsys):
+    base = tmp_path / "s.json"
+    cfg = Config(symbols="BTC/USDT,ETH/USDT", state_file=base)
+    for sym, sid in (("BTC/USDT", "aaaa1111"), ("ETH/USDT", "bbbb2222")):
+        rsi_bot.save_state(cfg.for_symbol(sym).state_file, {
+            "position": None, "last_candle": "t", "realized_pnl": 0.0, "trades": 0,
+            "signals": [{"id": sid, "side": "buy", "symbol": sym, "price": 10.0, "reason": "x",
+                         "created": __import__("time").time(), "status": "pending",
+                         "quote_usdt": 20.0}]})
+    monkeypatch.setattr(rsi_bot, "Config", lambda: cfg)
+    rsi_bot.main(["signals"])
+    out = __import__("json").loads(capsys.readouterr().out)
+    assert {s["id"] for s in out["pending"]} == {"aaaa1111", "bbbb2222"}
+    assert [p["symbol"] for p in out["pairs"]] == ["BTC/USDT", "ETH/USDT"]
+    rsi_bot.main(["confirm", "bbbb2222", "--price", "10", "--amount", "2", "--quote", "20"])
+    assert "ETH/USDT" in capsys.readouterr().out
+    assert rsi_bot.load_state(cfg.for_symbol("ETH/USDT").state_file)["position"]["amount"] == 2
+    assert rsi_bot.load_state(cfg.for_symbol("BTC/USDT").state_file)["position"] is None
