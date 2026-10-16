@@ -57,8 +57,8 @@ def oversold_then_bounce():
 
 
 def test_paper_buy_then_sell(tmp_path):
-    cfg = Config(mode="paper", stop_loss_pct=0, take_profit_pct=0, state_file=tmp_path / "s.json",
-                 telegram_token="")
+    cfg = Config(mode="paper", stop_loss_pct=0, take_profit_pct=0, trend_ema=0,
+                 state_file=tmp_path / "s.json", telegram_token="")
     trader = Trader(cfg, exchange=None)
     state = rsi_bot.load_state(cfg.state_file)
     closes = oversold_then_bounce()
@@ -137,7 +137,7 @@ def run_until_signal(closes, state, cfg, now=1000.0):
 
 
 def test_signals_mode_does_not_trade_until_confirmed(tmp_path):
-    cfg = Config(mode="signals", stop_loss_pct=0, take_profit_pct=0, telegram_token="")
+    cfg = Config(mode="signals", stop_loss_pct=0, take_profit_pct=0, trend_ema=0, telegram_token="")
     cfg.validate()  # ключи Binance не нужны
     state = run_until_signal(oversold_then_bounce(), rsi_bot.load_state(tmp_path / "s.json"), cfg)
     sig = pending_signal(state)
@@ -146,8 +146,8 @@ def test_signals_mode_does_not_trade_until_confirmed(tmp_path):
     assert state["position"] is None  # без подтверждения позиции нет
 
     state = confirm_signal(state, sig["id"], price=81.0, amount=0.2466, quote=20.0)
-    assert state["position"] == {"amount": 0.2466, "entry_price": 81.0, "cost": 20.0,
-                                 "opened": state["last_candle"]}
+    assert state["position"] == {"amount": 0.2466, "entry_price": 81.0, "peak": 81.0,
+                                 "cost": 20.0, "opened": state["last_candle"]}
     assert pending_signal(state) is None
     with pytest.raises(ValueError):
         confirm_signal(state, sig["id"], price=81.0, amount=0.2466)  # повторно нельзя
@@ -198,3 +198,75 @@ def test_cli_signals_confirm(tmp_path, monkeypatch, capsys):
     rsi_bot.main(["confirm", "abc12345", "--price", "100", "--amount", "0.1998", "--quote", "20"])
     assert "executed" in capsys.readouterr().out
     assert rsi_bot.load_state(path)["position"]["amount"] == 0.1998
+
+
+# ------------------------- защита от убытков ------------------------------ #
+
+def test_trend_filter_blocks_buy_in_downtrend(tmp_path):
+    closes = oversold_then_bounce()
+    with_filter = Config(mode="signals", trend_ema=20, stop_loss_pct=0, take_profit_pct=0)
+    state = run_until_signal(closes, rsi_bot.load_state(tmp_path / "a.json"), with_filter)
+    assert pending_signal(state) is None  # цена ниже EMA — нож не ловим
+    without = Config(mode="signals", trend_ema=0, stop_loss_pct=0, take_profit_pct=0)
+    state = run_until_signal(closes, rsi_bot.load_state(tmp_path / "b.json"), without)
+    assert pending_signal(state)["side"] == "buy"
+
+
+def test_trailing_stop_locks_profit():
+    cfg = Config(mode="paper", stop_loss_pct=3, take_profit_pct=0, trailing_pct=2, trend_ema=0)
+    trader = Trader(cfg, exchange=None)
+    state = {"position": {"amount": 1.0, "entry_price": 100.0, "peak": 100.0, "cost": 100.0,
+                          "opened": "x"},
+             "last_candle": None, "realized_pnl": 0.0, "trades": 0}
+    state = process_candles(make_df([100] * 20 + [110]), state, cfg, trader)
+    assert state["position"]["peak"] == 110  # максимум запомнили
+    state = process_candles(make_df([100] * 20 + [110, 107.5]), state, cfg, trader)
+    assert state["position"] is None  # 107.5 < 110 * 0.98 — сработал трейлинг
+    assert state["realized_pnl"] > 0
+
+
+def test_loss_streak_pauses_buying():
+    cfg = Config(max_loss_streak=2, pause_hours=10)
+    state = {"position": None, "last_candle": "2026-01-01 00:00:00+00:00", "realized_pnl": 0.0,
+             "trades": 0}
+    rsi_bot.record_result(state, -1.0, cfg)
+    assert "paused_until" not in state
+    rsi_bot.record_result(state, -1.0, cfg)
+    assert state["paused_until"] == pd.Timestamp("2026-01-01", tz="UTC").timestamp() + 10 * 3600
+    assert state["loss_streak"] == 0
+
+
+def test_backtest_reports_risk_metrics():
+    rng = np.random.default_rng(2)
+    df = make_df(100 * np.exp(rng.normal(0, 0.01, 3000).cumsum()))
+    res = backtest(df, Config(trend_ema=0, trailing_pct=2))
+    assert 0 <= res["max_drawdown_pct"] <= 100
+    assert res["profit_factor"] >= 0
+
+
+def test_optimize_walk_forward():
+    rng = np.random.default_rng(3)
+    df = make_df(100 * np.exp(rng.normal(0, 0.01, 3000).cumsum()))
+    r = rsi_bot.optimize(df, Config(), min_trades=1)
+    assert r["tested"] > 0
+    assert r["test_period"][0] > r["train_period"][1] - pd.Timedelta("15min")
+    assert set(r["best_params"]) == set(rsi_bot.OPTIMIZE_GRID)
+
+
+class PagedExchange:
+    def __init__(self, n):
+        self.rows = [[i * 60_000, 1, 1, 1, 1, 1] for i in range(n)]
+
+    def parse_timeframe(self, tf):
+        return 60
+
+    def milliseconds(self):
+        return len(self.rows) * 60_000
+
+    def fetch_ohlcv(self, symbol, timeframe, since, limit):
+        return [r for r in self.rows if r[0] >= since][:limit]
+
+
+def test_fetch_history_pages_past_1000():
+    df = rsi_bot.fetch_history(PagedExchange(2500), "BTC/USDT", "1m", 2500)
+    assert len(df) == 2500 and df["ts"].is_monotonic_increasing
