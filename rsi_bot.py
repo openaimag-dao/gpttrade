@@ -60,6 +60,9 @@ class Config:
     mode: str = os.getenv("MODE", "paper").lower()
     poll_seconds: int = int(os.getenv("POLL_SECONDS", 30))
     signal_ttl_minutes: float = _env_float("SIGNAL_TTL_MINUTES", 30)
+    # Публичное зеркало рыночных данных Binance для paper/signals/backtest, например
+    # https://data-api.binance.vision/api/v3 — помогает, если api.binance.com недоступен.
+    data_url: str = os.getenv("BINANCE_DATA_URL", "")
     state_file: Path = Path(os.getenv("STATE_FILE", "rsi_bot_state.json"))
     api_key: str = field(default_factory=lambda: os.getenv("BINANCE_API_KEY", ""))
     api_secret: str = field(default_factory=lambda: os.getenv("BINANCE_API_SECRET", ""))
@@ -124,12 +127,20 @@ def exit_reason(entry_price: float, price: float, cfg: Config) -> str | None:
 def make_exchange(cfg: Config):
     import ccxt
 
-    params = {"enableRateLimit": True}
-    if cfg.mode in ("testnet", "live"):
+    params = {
+        "enableRateLimit": True,
+        "requests_trust_env": True,  # учитывать HTTPS_PROXY / REQUESTS_CA_BUNDLE
+        # Бот торгует только спот: не запрашиваем рынки фьючерсов.
+        "options": {"fetchMarkets": {"types": ["spot"]}, "fetchCurrencies": False},
+    }
+    trading = cfg.mode in ("testnet", "live")
+    if trading:
         params.update(apiKey=cfg.api_key, secret=cfg.api_secret)
     exchange = ccxt.binance(params)
     if cfg.mode == "testnet":
         exchange.set_sandbox_mode(True)
+    if cfg.data_url and not trading:
+        exchange.urls["api"]["public"] = cfg.data_url.rstrip("/")
     exchange.load_markets()
     return exchange
 

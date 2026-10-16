@@ -90,6 +90,7 @@ nohup python3 crypto_macro_bot.py > bot.log 2>&1 &
 | `POLL_SECONDS` | `30` | Как часто опрашивать биржу |
 | `SIGNAL_TTL_MINUTES` | `30` | Сколько минут сигнал ждёт подтверждения (режим `signals`) |
 | `STATE_FILE` | `rsi_bot_state.json` | Файл состояния (позиция, P&L, сигналы) |
+| `BINANCE_DATA_URL` | — | Зеркало рыночных данных для `paper`/`signals`/`backtest`, напр. `https://data-api.binance.vision/api/v3` (если `api.binance.com` недоступен в вашем регионе) |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | — | Ключи API (для `testnet`/`live`) |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Необязательно: уведомления о сделках в Telegram |
 
@@ -110,6 +111,22 @@ MODE=testnet BINANCE_API_KEY=... BINANCE_API_SECRET=... python3 rsi_bot.py
 # 4) Реальная торговля — только после проверки на paper/testnet
 MODE=live CONFIRM_LIVE=yes BINANCE_API_KEY=... BINANCE_API_SECRET=... python3 rsi_bot.py
 ```
+
+### Демо: проверить, что бот работает (без денег и ключей)
+
+```bash
+# Бэктест на реальной истории Binance
+TIMEFRAME=1h python3 rsi_bot.py backtest
+
+# «Живой» прогон на минутных свечах с ослабленными уровнями, чтобы сигналы
+# появлялись быстрее. Сделки только симулируются.
+MODE=paper TIMEFRAME=1m RSI_BUY=45 RSI_SELL=55 POLL_SECONDS=15 \
+  STATE_FILE=demo.json python3 rsi_bot.py
+```
+
+В логе каждую минуту появляется строка с ценой закрытия и RSI, а при сигнале
+сообщения «🟢 КУПЛЕНО…» / «🔴 ПРОДАНО…» с P&L. Для обычной работы верните
+уровни 30/70 и таймфрейм 15m или больше.
 
 ### Режим сигналов с подтверждением через Binance MCP
 
