@@ -121,3 +121,80 @@ def test_backtest_runs():
     res = backtest(make_df(closes), Config())
     assert res["trades"] > 0
     assert 0 <= res["win_rate"] <= 100
+
+
+# ----------------------------- режим signals ------------------------------ #
+
+from rsi_bot import confirm_signal, pending_signal, process_signals, reject_signal
+
+
+def run_until_signal(closes, state, cfg, now=1000.0):
+    for n in range(20, len(closes) + 1):
+        state = process_signals(make_df(closes[:n]), state, cfg, now=now)
+        if pending_signal(state):
+            return state
+    return state
+
+
+def test_signals_mode_does_not_trade_until_confirmed(tmp_path):
+    cfg = Config(mode="signals", stop_loss_pct=0, take_profit_pct=0, telegram_token="")
+    cfg.validate()  # ключи Binance не нужны
+    state = run_until_signal(oversold_then_bounce(), rsi_bot.load_state(tmp_path / "s.json"), cfg)
+    sig = pending_signal(state)
+    assert sig["side"] == "buy" and sig["quote_usdt"] == cfg.order_usdt
+    assert sig["mcp_symbol"] == "BTCUSDT"
+    assert state["position"] is None  # без подтверждения позиции нет
+
+    state = confirm_signal(state, sig["id"], price=81.0, amount=0.2466, quote=20.0)
+    assert state["position"] == {"amount": 0.2466, "entry_price": 81.0, "cost": 20.0,
+                                 "opened": state["last_candle"]}
+    assert pending_signal(state) is None
+    with pytest.raises(ValueError):
+        confirm_signal(state, sig["id"], price=81.0, amount=0.2466)  # повторно нельзя
+
+
+def test_signal_sell_records_pnl_and_dedupes_stop_loss(tmp_path):
+    cfg = Config(mode="signals", stop_loss_pct=3, take_profit_pct=0)
+    state = {"position": {"amount": 1.0, "entry_price": 100.0, "cost": 100.0, "opened": "x"},
+             "last_candle": None, "realized_pnl": 0.0, "trades": 0, "signals": []}
+    df = make_df([100] * 20 + [96])
+    state = process_signals(df, state, cfg, now=0)
+    state = process_signals(df, state, cfg, now=30)  # стоп-лосс снова, но сигнал один
+    assert [s["side"] for s in state["signals"]] == ["sell"]
+    sig = pending_signal(state)
+    assert sig["amount"] == 1.0 and sig["reason"] == "стоп-лосс"
+    state = confirm_signal(state, sig["id"], price=96.0, amount=1.0, quote=95.9)
+    assert state["position"] is None
+    assert state["realized_pnl"] == pytest.approx(-4.1)
+    assert state["trades"] == 1
+
+
+def test_signal_expiry_and_reject_cooldown():
+    cfg = Config(mode="signals", stop_loss_pct=3, take_profit_pct=0, signal_ttl_minutes=10)
+    state = {"position": {"amount": 1.0, "entry_price": 100.0, "cost": 100.0, "opened": "x"},
+             "last_candle": None, "realized_pnl": 0.0, "trades": 0, "signals": []}
+    df = make_df([100] * 20 + [96])
+    state = process_signals(df, state, cfg, now=0)
+    state = reject_signal(state, state["signals"][0]["id"])
+    state = process_signals(df, state, cfg, now=60)  # сразу после отказа — не повторяем
+    assert pending_signal(state) is None
+    state = process_signals(df, state, cfg, now=11 * 60)  # после TTL — новый сигнал
+    assert pending_signal(state) is not None
+    state = process_signals(df, state, cfg, now=30 * 60)  # не подтвердили — истёк
+    assert state["signals"][1]["status"] == "expired"
+
+
+def test_cli_signals_confirm(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "s.json"
+    rsi_bot.save_state(path, {"position": None, "last_candle": "t", "realized_pnl": 0.0,
+                              "trades": 0, "signals": [
+                                  {"id": "abc12345", "side": "buy", "symbol": "BTC/USDT",
+                                   "mcp_symbol": "BTCUSDT", "price": 100.0, "reason": "RSI=31",
+                                   "created": __import__("time").time(), "status": "pending",
+                                   "quote_usdt": 20.0}]})
+    monkeypatch.setattr(rsi_bot, "Config", lambda: Config(state_file=path))
+    rsi_bot.main(["signals"])
+    assert '"abc12345"' in capsys.readouterr().out
+    rsi_bot.main(["confirm", "abc12345", "--price", "100", "--amount", "0.1998", "--quote", "20"])
+    assert "executed" in capsys.readouterr().out
+    assert rsi_bot.load_state(path)["position"]["amount"] == 0.1998

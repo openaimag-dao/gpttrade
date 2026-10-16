@@ -73,6 +73,7 @@ nohup python3 crypto_macro_bot.py > bot.log 2>&1 &
 | `MODE`    | Что происходит |
 |-----------|----------------|
 | `paper`   | По умолчанию. Реальные котировки, сделки только симулируются. Ключи не нужны. |
+| `signals` | Бот только присылает сигналы, а сделку вы подтверждаете и исполняете через Binance MCP в Claude Code. Ключи не нужны. |
 | `testnet` | Настоящие ордера на тестовой бирже Binance (ненастоящие деньги). Ключи с https://testnet.binance.vision |
 | `live`    | Реальные деньги. Дополнительно требуется `CONFIRM_LIVE=yes`. |
 
@@ -87,6 +88,8 @@ nohup python3 crypto_macro_bot.py > bot.log 2>&1 &
 | `ORDER_USDT` | `20` | Размер одной покупки в USDT |
 | `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` | `3` / `6` | Стоп-лосс и тейк-профит в %, `0` — выключить |
 | `POLL_SECONDS` | `30` | Как часто опрашивать биржу |
+| `SIGNAL_TTL_MINUTES` | `30` | Сколько минут сигнал ждёт подтверждения (режим `signals`) |
+| `STATE_FILE` | `rsi_bot_state.json` | Файл состояния (позиция, P&L, сигналы) |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | — | Ключи API (для `testnet`/`live`) |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Необязательно: уведомления о сделках в Telegram |
 
@@ -107,6 +110,42 @@ MODE=testnet BINANCE_API_KEY=... BINANCE_API_SECRET=... python3 rsi_bot.py
 # 4) Реальная торговля — только после проверки на paper/testnet
 MODE=live CONFIRM_LIVE=yes BINANCE_API_KEY=... BINANCE_API_SECRET=... python3 rsi_bot.py
 ```
+
+### Режим сигналов с подтверждением через Binance MCP
+
+В этом режиме у бота нет доступа к деньгам: он считает RSI по публичным свечам
+Binance и при сигнале присылает уведомление (в консоль и в Telegram). Сделку
+исполняет Claude Code через [официальный Binance MCP](https://developers.binance.com/en/docs/agent-native/mcp-server/agentic),
+и только после вашего «да». Торговля идёт внутри Agentic-субаккаунта, а вывода
+средств у MCP нет совсем.
+
+1. Один раз подключите MCP на своём компьютере (Claude Code):
+   ```bash
+   claude mcp add binance-mcp-server --transport http https://agent.binance.com/mcp/agentic
+   ```
+   затем `/mcp` → `binance-mcp-server` → авторизация (права Market data, Account,
+   Trade → Spot). Переведите в Agentic-субаккаунт только сумму, которой готовы рискнуть.
+2. Запустите бота в режиме сигналов:
+   ```bash
+   MODE=signals SYMBOL=BTC/USDT TIMEFRAME=15m ORDER_USDT=20 python3 rsi_bot.py
+   ```
+3. Когда придёт «🔔 Сигнал …», откройте Claude Code в папке репозитория и
+   введите `/rsi-signals`. Навык `.claude/skills/rsi-signals` покажет сигнал,
+   текущую цену и баланс и спросит подтверждение. После «да» он поставит
+   рыночный ордер через MCP (Binance тоже попросит подтвердить) и запишет
+   исполнение в бота.
+
+Команды для ручной работы с сигналами:
+
+```bash
+python3 rsi_bot.py signals                       # ожидающие сигналы и позиция (JSON)
+python3 rsi_bot.py confirm <id> --price 64000 --amount 0.000312 --quote 20
+python3 rsi_bot.py reject <id>
+```
+
+Если сигнал не подтвердить за `SIGNAL_TTL_MINUTES`, он истекает. Сигнал на
+продажу (по RSI, стоп-лоссу или тейк-профиту) появляется только после
+подтверждённой покупки.
 
 ### Безопасность API-ключа
 
