@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+rsi_bot_state.json
+*.tmp
+.env
