@@ -80,6 +80,17 @@ class Config:
     # Трейлинг-стоп: продать, если цена упала на TRAILING_PCT% от максимума после входа. 0 — выкл.
     trailing_pct: float = _env_float("TRAILING_PCT", 0)
     # После MAX_LOSS_STREAK убыточных сделок подряд — пауза в покупках на PAUSE_HOURS часов.
+    # Размер позиции по волатильности: в сделку идёт ORDER_USDT × min(1, VOL_TARGET_PCT / ATR%),
+    # где ATR% — средний размах свечи в % от цены. Спокойная монета — полная сумма,
+    # вдвое более бурная — половина. 0 — выключено (всегда полная сумма).
+    vol_target_pct: float = _env_float("VOL_TARGET_PCT", 0)
+    atr_period: int = int(os.getenv("ATR_PERIOD", 14))
+    # Режим рынка: покупать только при сильном тренде, ADX(14) >= ADX_MIN. 0 — выкл.
+    adx_min: float = _env_float("ADX_MIN", 0)
+    # Фильтр рынка: покупать любую пару, только когда MARKET_SYMBOL (BTC) выше своей
+    # EMA(MARKET_EMA) — альткоины почти всегда падают вместе с биткоином. 0 — выкл.
+    market_ema: int = int(os.getenv("MARKET_EMA", 0))
+    market_symbol: str = os.getenv("MARKET_SYMBOL", "BTC/USDT")
     max_loss_streak: int = int(os.getenv("MAX_LOSS_STREAK", 3))
     pause_hours: float = _env_float("PAUSE_HOURS", 24)
     mode: str = os.getenv("MODE", "paper").lower()
@@ -206,6 +217,59 @@ def strategy_signals(df: pd.DataFrame, cfg: Config) -> tuple[np.ndarray, np.ndar
 STRATEGIES = ("rsi", "ema_cross", "donchian", "bollinger", "macd")
 
 
+def compute_atr_adx(df: pd.DataFrame, period: int) -> tuple[np.ndarray, np.ndarray]:
+    """ATR и ADX по Уайлдеру."""
+    high, low, close = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+                   axis=1).max(axis=1)
+    up, down = high.diff(), -low.diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+    smooth = dict(alpha=1 / period, adjust=False, min_periods=period)
+    atr = tr.ewm(**smooth).mean()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        plus_di = 100 * plus_dm.ewm(**smooth).mean() / atr
+        minus_di = 100 * minus_dm.ewm(**smooth).mean() / atr
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = dx.ewm(**smooth).mean()
+    return atr.to_numpy(), adx.to_numpy()
+
+
+def position_fraction(df: pd.DataFrame, cfg: Config) -> np.ndarray:
+    """Доля ORDER_USDT для входа на каждой свече (1 — полная сумма)."""
+    if cfg.vol_target_pct <= 0:
+        return np.ones(len(df))
+    atr, _ = compute_atr_adx(df, cfg.atr_period)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        atr_pct = atr / df["close"].to_numpy(float) * 100
+        frac = np.clip(cfg.vol_target_pct / atr_pct, 0.0, 1.0)
+    return np.where(np.isnan(frac), 1.0, frac)
+
+
+def market_mask(df: pd.DataFrame, cfg: Config, market: pd.DataFrame | None) -> np.ndarray:
+    """True там, где рынок (BTC) выше своей EMA — покупки разрешены."""
+    if cfg.market_ema <= 0:
+        return np.ones(len(df), dtype=bool)
+    if market is None:
+        raise ValueError(f"Для MARKET_EMA нужны свечи {cfg.market_symbol}")
+    m = market.set_index("ts")["close"].astype(float)
+    ok = m > compute_ema(m, cfg.market_ema)
+    # Свеча рынка с тем же временем открытия закрывается одновременно со свечой пары.
+    aligned = ok.reindex(pd.DatetimeIndex(df["ts"]), method="ffill")
+    return aligned.fillna(False).to_numpy(bool)
+
+
+def entry_mask(df: pd.DataFrame, cfg: Config, market: pd.DataFrame | None = None) -> np.ndarray:
+    """Все фильтры входа вместе: тренд пары, сила тренда (ADX), тренд рынка."""
+    mask = trend_mask(df, cfg) & market_mask(df, cfg, market)
+    if cfg.adx_min > 0:
+        _, adx = compute_atr_adx(df, 14)
+        with np.errstate(invalid="ignore"):
+            mask &= adx >= cfg.adx_min
+    return mask
+
+
 def trend_mask(df: pd.DataFrame, cfg: Config) -> np.ndarray:
     """True там, где фильтр тренда разрешает покупку (цена выше EMA)."""
     if cfg.trend_ema <= 0:
@@ -314,12 +378,13 @@ class Trader:
         self.ex = exchange
         self.base = cfg.symbol.split("/")[0]
 
-    def buy(self, price: float) -> dict:
-        """Покупка на ORDER_USDT. Возвращает {'amount', 'price'}."""
+    def buy(self, price: float, quote: float | None = None) -> dict:
+        """Покупка на quote USDT (по умолчанию ORDER_USDT). Возвращает {'amount', 'price'}."""
+        quote = self.cfg.order_usdt if quote is None else quote
         if self.cfg.mode == "paper":
-            amount = self.cfg.order_usdt * (1 - FEE_RATE) / price
+            amount = quote * (1 - FEE_RATE) / price
             return {"amount": amount, "price": price}
-        order = self.ex.create_market_buy_order_with_cost(self.cfg.symbol, self.cfg.order_usdt)
+        order = self.ex.create_market_buy_order_with_cost(self.cfg.symbol, quote)
         filled = float(order.get("filled") or 0)
         avg = float(order.get("average") or price)
         # Если комиссия списана в базовой монете — продать можно только остаток.
@@ -343,7 +408,8 @@ class Trader:
         return {"amount": qty, "price": avg, "proceeds": proceeds}
 
 
-def evaluate(df: pd.DataFrame, state: dict, cfg: Config) -> dict | None:
+def evaluate(df: pd.DataFrame, state: dict, cfg: Config,
+             market: pd.DataFrame | None = None) -> dict | None:
     """Решение стратегии на текущем шаге: {'side', 'price', 'reason'} или None.
 
     df — свечи, последняя может быть ещё не закрыта. Отмечает обработанную
@@ -383,19 +449,31 @@ def evaluate(df: pd.DataFrame, state: dict, cfg: Config) -> dict | None:
         logger.info("Сигнал на покупку пропущен: цена ниже EMA(%d) — нисходящий тренд",
                     cfg.trend_ema)
         return None
-    return {"side": "buy", "price": last_price, "reason": reason}
+    if not market_mask(closed, cfg, market)[-1]:
+        logger.info("Сигнал на покупку пропущен: %s ниже EMA(%d) — рынок падает",
+                    cfg.market_symbol, cfg.market_ema)
+        return None
+    if not entry_mask(closed, cfg, market)[-1]:
+        logger.info("Сигнал на покупку пропущен: слабый тренд (ADX < %g)", cfg.adx_min)
+        return None
+    fraction = float(position_fraction(closed, cfg)[-1])
+    if fraction < 1:
+        reason += f", размер {fraction:.0%} (волатильность)"
+    return {"side": "buy", "price": last_price, "reason": reason, "fraction": fraction}
 
 
-def process_candles(df: pd.DataFrame, state: dict, cfg: Config, trader: Trader) -> dict:
+def process_candles(df: pd.DataFrame, state: dict, cfg: Config, trader: Trader,
+                    market: pd.DataFrame | None = None) -> dict:
     """Один шаг автоторговли (paper / testnet / live)."""
-    decision = evaluate(df, state, cfg)
+    decision = evaluate(df, state, cfg, market)
     if not decision:
         return state
     if decision["side"] == "sell":
         return _close(state, cfg, trader, decision["price"], decision["reason"])
-    fill = trader.buy(decision["price"])
+    quote = cfg.order_usdt * decision["fraction"]
+    fill = trader.buy(decision["price"], quote)
     state["position"] = {"amount": fill["amount"], "entry_price": fill["price"],
-                         "peak": fill["price"], "cost": cfg.order_usdt,
+                         "peak": fill["price"], "cost": quote,
                          "opened": state["last_candle"]}
     notify(cfg, f"🟢 [{cfg.mode}] КУПЛЕНО {fill['amount']:.6f} {cfg.symbol} "
                 f"по {fill['price']:.4f}\n{decision['reason']}")
@@ -417,11 +495,12 @@ def expire_signals(state: dict, cfg: Config, now: float | None = None) -> None:
             sig["status"] = "expired"
 
 
-def process_signals(df: pd.DataFrame, state: dict, cfg: Config, now: float | None = None) -> dict:
+def process_signals(df: pd.DataFrame, state: dict, cfg: Config, now: float | None = None,
+                    market: pd.DataFrame | None = None) -> dict:
     """Один шаг режима signals: вместо ордера создаёт сигнал на подтверждение."""
     state.setdefault("signals", [])
     expire_signals(state, cfg, now)
-    decision = evaluate(df, state, cfg)
+    decision = evaluate(df, state, cfg, market)
     if not decision:
         return state
     now = time.time() if now is None else now
@@ -447,8 +526,8 @@ def process_signals(df: pd.DataFrame, state: dict, cfg: Config, now: float | Non
         "status": "pending",
     }
     if sig["side"] == "buy":
-        sig["quote_usdt"] = cfg.order_usdt
-        action = f"КУПИТЬ {cfg.symbol} на {cfg.order_usdt} USDT по рынку"
+        sig["quote_usdt"] = round(cfg.order_usdt * decision["fraction"], 2)
+        action = f"КУПИТЬ {cfg.symbol} на {sig['quote_usdt']:g} USDT по рынку"
     else:
         sig["amount"] = pos["amount"]
         action = f"ПРОДАТЬ {pos['amount']:.6f} {cfg.symbol} по рынку"
@@ -515,17 +594,25 @@ def run(cfg: Config) -> None:
     pairs = ", ".join(c.symbol for c in configs)
     notify(cfg, f"🤖 Бот запущен: {pairs} {cfg.timeframe}, режим {cfg.mode}, "
                 f"{describe(cfg)}, ордер {cfg.order_usdt} USDT на каждую пару")
-    limit = min(1000, max(300, cfg.trend_ema * 3, cfg.slow_ema * 3))
+    limit = min(1000, max(300, cfg.trend_ema * 3, cfg.slow_ema * 3, cfg.market_ema * 3))
     while True:
+        market = None
+        if cfg.market_ema > 0:
+            try:
+                market = fetch_candles(exchange, cfg.market_symbol, cfg.timeframe, limit=limit)
+            except Exception as exc:
+                logger.exception("Не удалось загрузить %s: %s", cfg.market_symbol, exc)
+                time.sleep(cfg.poll_seconds)
+                continue
         for c in configs:
             try:
                 df = fetch_candles(exchange, c.symbol, c.timeframe, limit=limit)
                 # Перечитываем файл: в режиме signals его меняют команды confirm/reject.
                 state = load_state(c.state_file)
                 if c.mode == "signals":
-                    state = process_signals(df, state, c)
+                    state = process_signals(df, state, c, market=market)
                 else:
-                    state = process_candles(df, state, c, traders[c.symbol])
+                    state = process_candles(df, state, c, traders[c.symbol], market)
                 save_state(c.state_file, state)
             except KeyboardInterrupt:
                 raise
@@ -540,20 +627,24 @@ def run(cfg: Config) -> None:
 
 def backtest(df: pd.DataFrame, cfg: Config,
              signals: tuple[np.ndarray, np.ndarray] | None = None,
-             trend: np.ndarray | None = None, start: int = 1, end: int | None = None) -> dict:
+             trend: np.ndarray | None = None, start: int = 1, end: int | None = None,
+             market: pd.DataFrame | None = None, fractions: np.ndarray | None = None) -> dict:
     """Симуляция той же логики, что и в живом режиме, на свечах df[start:end].
 
     Вход и выход по сигналу стратегии — по цене закрытия; стоп/трейлинг/тейк —
     по high/low (при гэпе — по цене открытия). Если стоп и тейк задеты одной
     свечой, считаем стоп (консервативно). Комиссия FEE_RATE на каждую сторону.
-    signals/trend можно передать заранее посчитанными по всей истории.
+    signals / trend (все фильтры входа) / fractions можно передать заранее
+    посчитанными по всей истории. Невложенная часть доли (при VOL_TARGET_PCT)
+    остаётся в USDT.
     """
     end = len(df) if end is None else end
     start = max(start, 1)
     close, high = df["close"].to_numpy(float), df["high"].to_numpy(float)
     low, opn = df["low"].to_numpy(float), df["open"].to_numpy(float)
     entries, exits = signals if signals is not None else strategy_signals(df, cfg)[:2]
-    trend = trend_mask(df, cfg) if trend is None else trend
+    trend = entry_mask(df, cfg, market) if trend is None else trend
+    fractions = position_fraction(df, cfg) if fractions is None else fractions
     bar_seconds = (df["ts"].iloc[1] - df["ts"].iloc[0]).total_seconds() if len(df) > 1 else 60
     pause_bars = math.ceil(cfg.pause_hours * 3600 / bar_seconds)
 
@@ -572,8 +663,9 @@ def backtest(df: pd.DataFrame, cfg: Config,
             elif exits[i]:
                 exit_price = close[i]
             if exit_price is not None:
-                equity = pos["amount"] * exit_price * (1 - FEE_RATE)
-                ret = equity / pos["cost"] - 1
+                proceeds = pos["amount"] * exit_price * (1 - FEE_RATE)
+                equity = pos["cash"] + proceeds
+                ret = proceeds / pos["cost"] - 1
                 trades.append(ret)
                 streak = streak + 1 if ret < 0 else 0
                 if cfg.max_loss_streak > 0 and streak >= cfg.max_loss_streak:
@@ -582,15 +674,17 @@ def backtest(df: pd.DataFrame, cfg: Config,
             else:
                 pos["peak"] = max(pos["peak"], high[i])
         elif entries[i] and trend[i] and i > paused_until:
-            pos = {"entry": close[i], "peak": close[i], "cost": equity,
-                   "amount": equity * (1 - FEE_RATE) / close[i]}
-        mark = pos["amount"] * close[i] if pos else equity
+            cost = equity * fractions[i]
+            pos = {"entry": close[i], "peak": close[i], "cost": cost, "cash": equity - cost,
+                   "amount": cost * (1 - FEE_RATE) / close[i]}
+        mark = pos["cash"] + pos["amount"] * close[i] if pos else equity
         curve[i - start] = mark
         peak_equity = max(peak_equity, mark)
         max_dd = max(max_dd, 1 - mark / peak_equity)
     if pos:  # закрываем открытую позицию по последней цене отрезка
-        equity = pos["amount"] * close[end - 1] * (1 - FEE_RATE)
-        trades.append(equity / pos["cost"] - 1)
+        proceeds = pos["amount"] * close[end - 1] * (1 - FEE_RATE)
+        equity = pos["cash"] + proceeds
+        trades.append(proceeds / pos["cost"] - 1)
         if len(curve):
             curve[-1] = equity  # кривая заканчивается тем же капиталом, что и итог
     gains = sum(t for t in trades if t > 0)
@@ -647,12 +741,19 @@ def describe(cfg: Config) -> str:
              f"TP {cfg.take_profit_pct:g}%" if cfg.take_profit_pct else "TP выкл",
              f"трейлинг {cfg.trailing_pct:g}%" if cfg.trailing_pct else "трейлинг выкл",
              f"EMA{cfg.trend_ema}" if cfg.trend_ema else "без фильтра тренда"]
+    if cfg.adx_min:
+        parts.append(f"ADX ≥ {cfg.adx_min:g}")
+    if cfg.market_ema:
+        parts.append(f"{cfg.market_symbol.split('/')[0]} > EMA{cfg.market_ema}")
+    if cfg.vol_target_pct:
+        parts.append(f"размер по волатильности (цель ATR {cfg.vol_target_pct:g}%)")
     return ", ".join(parts)
 
 
 def env_line(cfg: Config) -> str:
     keys = ("strategy",) + STRATEGY_PARAMS[cfg.strategy] + (
         "stop_loss_pct", "take_profit_pct", "trailing_pct", "trend_ema", "timeframe")
+    keys += tuple(k for k in ("adx_min", "market_ema", "vol_target_pct") if getattr(cfg, k))
     return " ".join(f"{k.upper()}={getattr(cfg, k)}" for k in keys)
 
 
@@ -667,17 +768,20 @@ def format_result(res: dict) -> str:
 def run_backtest(cfg: Config, candles: int) -> None:
     exchange = make_exchange(Config(symbol=cfg.symbol, mode="paper"))
     df = fetch_history(exchange, cfg.symbol, cfg.timeframe, candles)
+    market = (fetch_history(exchange, cfg.market_symbol, cfg.timeframe, candles)
+              if cfg.market_ema > 0 else None)
     print(f"Бэктест {cfg.symbol} {cfg.timeframe}, {len(df)} свечей "
           f"({df['ts'].iloc[0]:%Y-%m-%d} — {df['ts'].iloc[-1]:%Y-%m-%d})")
     print(describe(cfg))
-    print(format_result(backtest(df, cfg)))
+    print(format_result(backtest(df, cfg, market=market)))
 
 
 def max_drawdown(curve: np.ndarray) -> float:
     return float((1 - curve / np.maximum.accumulate(curve)).max() * 100) if len(curve) else 0.0
 
 
-def portfolio_backtest(frames: dict[str, pd.DataFrame], cfg: Config) -> dict:
+def portfolio_backtest(frames: dict[str, pd.DataFrame], cfg: Config,
+                       market: pd.DataFrame | None = None) -> dict:
     """Бэктест портфеля: каждой паре — своя равная доля (ORDER_USDT), торгуют независимо.
 
     Сравнение идёт на общем периоде, когда торговались все пары; индикаторы
@@ -690,7 +794,7 @@ def portfolio_backtest(frames: dict[str, pd.DataFrame], cfg: Config) -> dict:
         c = cfg.for_symbol(sym)
         start = max(1, int(df["ts"].searchsorted(start_ts)))
         end = int(df["ts"].searchsorted(end_ts, side="right"))
-        res = backtest(df, c, start=start, end=end)
+        res = backtest(df, c, start=start, end=end, market=market)
         per_symbol[sym] = res
         curves.append(res["equity_curve"])
         closes = df["close"].to_numpy(float)[start - 1:end]
@@ -716,7 +820,12 @@ def run_portfolio(cfg: Config, candles: int) -> None:
         raise ValueError("Для портфеля задайте SYMBOLS, например BTC/USDT,ETH/USDT,SOL/USDT")
     exchange = make_exchange(Config(mode="paper"))
     frames = {sym: fetch_history(exchange, sym, cfg.timeframe, candles) for sym in symbols}
-    r = portfolio_backtest(frames, cfg)
+    market = None
+    if cfg.market_ema > 0:
+        market = frames.get(cfg.market_symbol)
+        if market is None:
+            market = fetch_history(exchange, cfg.market_symbol, cfg.timeframe, candles)
+    r = portfolio_backtest(frames, cfg, market)
     print(f"Портфель {len(symbols)} пар, {cfg.timeframe}, {describe(cfg)}")
     print(f"Период {r['period'][0]:%Y-%m-%d} — {r['period'][1]:%Y-%m-%d}, "
           f"по {cfg.order_usdt:g} USDT на пару\n")
@@ -749,7 +858,7 @@ def _grid(grid: dict) -> list[dict]:
 
 
 def walk_forward(df: pd.DataFrame, cfg: Config, strategy: str, folds: int = 3,
-                 min_trades: int = 5) -> dict:
+                 min_trades: int = 5, market: pd.DataFrame | None = None) -> dict:
     """Walk-forward проверка стратегии.
 
     История делится на folds+1 равных частей. На шаге k параметры подбираются
@@ -765,7 +874,12 @@ def walk_forward(df: pd.DataFrame, cfg: Config, strategy: str, folds: int = 3,
     signals = {}
     for sc in strat_combos:
         signals[tuple(sc.items())] = strategy_signals(df, Config(**{**base.__dict__, **sc}))[:2]
-    trends = {t: trend_mask(df, Config(**{**base.__dict__, "trend_ema": t}))
+    extra = market_mask(df, base, market)
+    if base.adx_min > 0:
+        with np.errstate(invalid="ignore"):
+            extra &= compute_atr_adx(df, 14)[1] >= base.adx_min
+    fractions = position_fraction(df, base)
+    trends = {t: trend_mask(df, Config(**{**base.__dict__, "trend_ema": t})) & extra
               for t in RISK_GRID["trend_ema"]}
     risk_combos = _grid(RISK_GRID)
 
@@ -778,7 +892,8 @@ def walk_forward(df: pd.DataFrame, cfg: Config, strategy: str, folds: int = 3,
             sig = signals[tuple(sc.items())]
             for rc in risk_combos:
                 c = Config(**{**base.__dict__, **sc, **rc})
-                res = backtest(df, c, sig, trends[c.trend_ema], start=1, end=train_end)
+                res = backtest(df, c, sig, trends[c.trend_ema], start=1, end=train_end,
+                               fractions=fractions)
                 if res["trades"] < min_trades:
                     continue
                 score = res["return_pct"] - 0.5 * res["max_drawdown_pct"]
@@ -790,7 +905,8 @@ def walk_forward(df: pd.DataFrame, cfg: Config, strategy: str, folds: int = 3,
             continue
         _, c, train_res = best
         sig = signals[tuple((key, getattr(c, key)) for key in STRATEGY_GRIDS[strategy])]
-        test_res = backtest(df, c, sig, trends[c.trend_ema], start=train_end, end=test_end)
+        test_res = backtest(df, c, sig, trends[c.trend_ema], start=train_end, end=test_end,
+                            fractions=fractions)
         growth *= 1 + test_res["return_pct"] / 100
         fold_results.append({"cfg": c, "train": train_res, "test": test_res,
                              "period": (df["ts"].iloc[train_end], df["ts"].iloc[test_end - 1])})
@@ -812,12 +928,14 @@ def walk_forward(df: pd.DataFrame, cfg: Config, strategy: str, folds: int = 3,
 def run_optimize(cfg: Config, candles: int, strategy: str, folds: int) -> None:
     exchange = make_exchange(Config(symbol=cfg.symbol, mode="paper"))
     df = fetch_history(exchange, cfg.symbol, cfg.timeframe, candles)
+    market = (fetch_history(exchange, cfg.market_symbol, cfg.timeframe, candles)
+              if cfg.market_ema > 0 else None)
     names = STRATEGIES if strategy == "all" else (strategy,)
     print(f"Walk-forward {cfg.symbol} {cfg.timeframe}: {len(df)} свечей "
           f"({df['ts'].iloc[0]:%Y-%m-%d} — {df['ts'].iloc[-1]:%Y-%m-%d}), {folds} тестовых отрезка\n")
     results = []
     for name in names:
-        r = walk_forward(df, cfg, name, folds)
+        r = walk_forward(df, cfg, name, folds, market=market)
         results.append(r)
         print(f"== {name} ({r['combos']} комбинаций на отрезок)")
         for i, f in enumerate(r["folds"], 1):

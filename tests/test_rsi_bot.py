@@ -341,3 +341,62 @@ def test_cli_portfolio_signals_and_confirm(tmp_path, monkeypatch, capsys):
     assert "ETH/USDT" in capsys.readouterr().out
     assert rsi_bot.load_state(cfg.for_symbol("ETH/USDT").state_file)["position"]["amount"] == 2
     assert rsi_bot.load_state(cfg.for_symbol("BTC/USDT").state_file)["position"] is None
+
+
+# --------------------- «умные» фильтры и размер позиции -------------------- #
+
+def test_adx_high_in_trend_low_in_chop():
+    trend = make_df(np.linspace(100, 200, 300))
+    chop = make_df(100 + np.tile([0, 1, 0, -1], 75))
+    _, adx_trend = rsi_bot.compute_atr_adx(trend, 14)
+    _, adx_chop = rsi_bot.compute_atr_adx(chop, 14)
+    assert adx_trend[-1] > 50 > adx_chop[-1]
+
+
+def test_position_fraction_shrinks_for_volatile_coin():
+    calm = make_df(100 + np.tile([0.0, 0.5], 100))      # ATR ≈ 0.6%
+    wild = calm.copy()
+    wild["high"], wild["low"] = wild["close"] * 1.03, wild["close"] * 0.97  # ATR ≈ 6%
+    cfg = Config(vol_target_pct=3)
+    assert rsi_bot.position_fraction(calm, cfg)[-1] == 1.0
+    assert rsi_bot.position_fraction(wild, cfg)[-1] == pytest.approx(0.5, rel=0.1)
+    assert (rsi_bot.position_fraction(wild, Config(vol_target_pct=0)) == 1).all()
+
+
+def test_market_mask_follows_btc_trend():
+    alt = make_df(np.full(120, 10.0))
+    btc_up = make_df(np.linspace(100, 200, 120))
+    btc_down = make_df(np.linspace(200, 100, 120))
+    cfg = Config(market_ema=20)
+    assert rsi_bot.market_mask(alt, cfg, btc_up)[-1]
+    assert not rsi_bot.market_mask(alt, cfg, btc_down)[-1]
+    with pytest.raises(ValueError):
+        rsi_bot.market_mask(alt, cfg, None)
+
+
+def test_backtest_keeps_uninvested_part_in_cash():
+    df = make_df(np.r_[np.linspace(100, 50, 50), np.full(10, 50.0)])
+    entries = np.zeros(len(df), bool); entries[1] = True
+    exits = np.zeros(len(df), bool); exits[-1] = True
+    cfg = Config(trend_ema=0, stop_loss_pct=0, take_profit_pct=0, order_usdt=100)
+    full = backtest(df, cfg, (entries, exits), fractions=np.ones(len(df)))
+    half = backtest(df, cfg, (entries, exits), fractions=np.full(len(df), 0.5))
+    assert half["return_pct"] == pytest.approx(full["return_pct"] / 2, rel=0.01)
+    assert half["max_drawdown_pct"] < full["max_drawdown_pct"]
+
+
+def test_signal_quote_scaled_by_volatility_and_btc_filter(tmp_path):
+    closes = oversold_then_bounce()
+    btc_down = make_df(np.linspace(200, 100, len(closes)))
+    cfg = Config(mode="signals", trend_ema=0, stop_loss_pct=0, take_profit_pct=0,
+                 market_ema=10, order_usdt=20)
+    state = rsi_bot.load_state(tmp_path / "a.json")
+    for n in range(20, len(closes) + 1):
+        state = process_signals(make_df(closes[:n]), state, cfg, market=btc_down.iloc[:n])
+    assert pending_signal(state) is None  # BTC падает — альткоин не покупаем
+
+    cfg = Config(mode="signals", trend_ema=0, stop_loss_pct=0, take_profit_pct=0,
+                 vol_target_pct=0.1, order_usdt=20)
+    state = run_until_signal(closes, rsi_bot.load_state(tmp_path / "b.json"), cfg)
+    sig = pending_signal(state)
+    assert 0 < sig["quote_usdt"] < 20 and "размер" in sig["reason"]
