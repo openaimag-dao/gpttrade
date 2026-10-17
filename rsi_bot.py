@@ -722,8 +722,9 @@ def run_portfolio(cfg: Config, candles: int) -> None:
           f"по {cfg.order_usdt:g} USDT на пару\n")
     for sym, res in r["per_symbol"].items():
         print(f"  {sym:10} {format_result(res)}")
+    days = max((r["period"][1] - r["period"][0]).total_seconds() / 86400, 1)
     print(f"\nПОРТФЕЛЬ: доходность {r['return_pct']:+.2f}%, макс. просадка "
-          f"{r['max_drawdown_pct']:.1f}%, сделок {r['trades']}")
+          f"{r['max_drawdown_pct']:.1f}%, сделок {r['trades']} ({r['trades'] / days:.1f} в день)")
     print(f"Купить и держать те же пары: {r['buy_and_hold_pct']:+.2f}%, "
           f"просадка {r['buy_and_hold_drawdown_pct']:.1f}%")
 
